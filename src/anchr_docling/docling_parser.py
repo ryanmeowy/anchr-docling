@@ -1,0 +1,319 @@
+import os
+import platform
+import tempfile
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+import httpx
+
+from anchr_docling.config import settings
+from anchr_docling.schemas import ParseOptions, ParseRequest, ParseResponse
+
+
+class SourceDownloadError(RuntimeError):
+    pass
+
+
+class DoclingParseError(RuntimeError):
+    pass
+
+
+class DoclingParser:
+    def parse(self, request: ParseRequest) -> ParseResponse:
+        suffix = resolve_suffix(request.file_name, str(request.source_url))
+        with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
+            source_path = Path(tmp_dir) / f"source{suffix}"
+            download_source(str(request.source_url), source_path)
+            text = convert_to_markdown(source_path, request.options)
+
+        return ParseResponse(
+            requestId=request.request_id,
+            parser="docling",
+            format="markdown",
+            text=text,
+            pages=[],
+        )
+
+
+def download_source(source_url: str, target_path: Path) -> None:
+    timeout = httpx.Timeout(
+        connect=settings.connect_timeout_seconds,
+        read=settings.read_timeout_seconds,
+        write=settings.connect_timeout_seconds,
+        pool=settings.connect_timeout_seconds,
+    )
+    max_bytes = settings.max_download_mb * 1024 * 1024
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; AnchrDocling/1.0)",
+        "Accept": "application/pdf,application/octet-stream,text/html,text/plain,*/*",
+    }
+
+    total = 0
+    try:
+        with httpx.stream("GET", source_url, headers=headers, follow_redirects=True, timeout=timeout) as response:
+            response.raise_for_status()
+            with target_path.open("wb") as output:
+                for chunk in response.iter_bytes():
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise SourceDownloadError(
+                            f"source file exceeds {settings.max_download_mb} MB limit"
+                        )
+                    output.write(chunk)
+    except httpx.HTTPStatusError as exc:
+        raise SourceDownloadError(
+            f"source URL responded HTTP {exc.response.status_code}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
+
+
+def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
+    try:
+        configure_torch_device()
+        from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import (
+            EasyOcrOptions,
+            OcrMacOptions,
+            PdfPipelineOptions,
+            RapidOcrOptions,
+            TesseractOcrOptions,
+        )
+        from docling.document_converter import DocumentConverter
+        from docling.document_converter import PdfFormatOption
+    except ImportError as exc:
+        raise DoclingParseError("docling is not installed") from exc
+
+    try:
+        ocr_options_by_engine = {
+            "easyocr": EasyOcrOptions,
+            "ocrmac": OcrMacOptions,
+            "rapidocr": RapidOcrOptions,
+            "tesseract": TesseractOcrOptions,
+        }
+        text = run_docling_convert(
+            source_path,
+            options,
+            PdfPipelineOptions,
+            AcceleratorOptions,
+            AcceleratorDevice,
+            DocumentConverter,
+            InputFormat,
+            PdfFormatOption,
+            ocr_options_by_engine,
+            ocr=options.ocr,
+            ocr_engine=first_configured_ocr_engine(),
+        )
+        if (
+            options.validate_text_quality
+            and not options.ocr
+            and looks_garbled(text)
+            and options.ocr_fallback
+        ):
+            text = run_ocr_fallback_chain(
+                source_path,
+                options,
+                PdfPipelineOptions,
+                AcceleratorOptions,
+                AcceleratorDevice,
+                DocumentConverter,
+                InputFormat,
+                PdfFormatOption,
+                ocr_options_by_engine,
+            )
+    except Exception as exc:
+        raise DoclingParseError(f"docling parse failed: {exc}") from exc
+
+    if not text or not text.strip():
+        raise DoclingParseError("docling returned empty content")
+    if options.validate_text_quality and looks_garbled(text):
+        raise DoclingParseError(
+            "docling returned garbled text. The PDF may use custom font encoding; retry with "
+            "`ocrFallback: true` or `ocr: true`."
+        )
+    return text.strip()
+
+
+def run_docling_convert(
+    source_path: Path,
+    options: ParseOptions,
+    pdf_pipeline_options: type,
+    accelerator_options: type,
+    accelerator_device: type,
+    document_converter: type,
+    input_format: type,
+    pdf_format_option: type,
+    ocr_options_by_engine: dict[str, type],
+    *,
+    ocr: bool,
+    ocr_engine: str | None,
+) -> str:
+    pipeline_options = pdf_pipeline_options()
+    pipeline_options.accelerator_options = accelerator_options(
+        num_threads=4,
+        device=resolve_accelerator_device(accelerator_device),
+    )
+    pipeline_options.do_ocr = ocr
+    pipeline_options.force_backend_text = not ocr
+    if ocr:
+        if ocr_engine is None:
+            raise DoclingParseError("OCR engine is required when OCR is enabled")
+        pipeline_options.ocr_options = build_ocr_options(ocr_options_by_engine, ocr_engine)
+    pipeline_options.do_table_structure = options.table_structure
+    pipeline_options.do_picture_classification = False
+    pipeline_options.do_picture_description = False
+    pipeline_options.do_code_enrichment = False
+    pipeline_options.do_formula_enrichment = False
+    pipeline_options.generate_page_images = False
+    pipeline_options.generate_picture_images = False
+    pipeline_options.generate_table_images = False
+    converter = document_converter(
+        format_options={
+            input_format.PDF: pdf_format_option(pipeline_options=pipeline_options),
+        }
+    )
+    result = converter.convert(source_path)
+    return result.document.export_to_markdown()
+
+
+def run_ocr_fallback_chain(
+    source_path: Path,
+    options: ParseOptions,
+    pdf_pipeline_options: type,
+    accelerator_options: type,
+    accelerator_device: type,
+    document_converter: type,
+    input_format: type,
+    pdf_format_option: type,
+    ocr_options_by_engine: dict[str, type],
+) -> str:
+    errors: list[str] = []
+    for engine in configured_ocr_engines():
+        try:
+            text = run_docling_convert(
+                source_path,
+                options,
+                pdf_pipeline_options,
+                accelerator_options,
+                accelerator_device,
+                document_converter,
+                input_format,
+                pdf_format_option,
+                ocr_options_by_engine,
+                ocr=True,
+                ocr_engine=engine,
+            )
+            if text and text.strip() and not looks_garbled(text):
+                return text
+            errors.append(f"{engine}: empty or garbled OCR result")
+        except Exception as exc:
+            errors.append(f"{engine}: {exc}")
+    raise DoclingParseError("all OCR engines failed; " + " | ".join(errors))
+
+
+def build_ocr_options(ocr_options_by_engine: dict[str, type], engine: str) -> object:
+    options_class = ocr_options_by_engine.get(engine)
+    if options_class is None:
+        raise DoclingParseError(f"unsupported OCR engine: {engine}")
+
+    lang = resolve_ocr_languages(engine, explicit=True)
+    options = options_class(lang=lang)
+    options.force_full_page_ocr = settings.force_full_page_ocr
+    if hasattr(options, "use_gpu"):
+        options.use_gpu = settings.device.strip().lower() not in {"cpu", ""}
+    return options
+
+
+def configured_ocr_engines() -> list[str]:
+    engines = [item.strip().lower() for item in settings.ocr_engines.split(",") if item.strip()]
+    if engines:
+        return engines
+    if platform.system() == "Darwin":
+        return ["ocrmac", "rapidocr"]
+    return ["rapidocr"]
+
+
+def first_configured_ocr_engine() -> str | None:
+    engines = configured_ocr_engines()
+    return engines[0] if engines else None
+
+
+def resolve_ocr_languages(engine: str, *, explicit: bool) -> list[str]:
+    configured = [item.strip() for item in settings.ocr_lang.split(",") if item.strip()]
+    if configured and (explicit or settings.ocr_lang != "chinese"):
+        if engine == "ocrmac" and configured == ["chinese"]:
+            return ["zh-Hans", "en-US"]
+        if engine == "easyocr" and configured == ["chinese"]:
+            return ["ch_sim", "en"]
+        if engine == "tesseract" and configured == ["chinese"]:
+            return ["chi_sim", "eng"]
+        return configured
+    if engine == "ocrmac":
+        return ["zh-Hans", "en-US"]
+    if engine == "tesseract":
+        return ["chi_sim", "eng"]
+    if engine == "easyocr":
+        return ["ch_sim", "en"]
+    return ["chinese"]
+
+
+def configure_torch_device() -> None:
+    if settings.device.strip().lower() == "cpu":
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+
+def resolve_accelerator_device(accelerator_device: type) -> object:
+    device = settings.device.strip().lower()
+    if device == "mps":
+        return accelerator_device.MPS
+    if device == "cuda":
+        return accelerator_device.CUDA
+    if device == "xpu":
+        return accelerator_device.XPU
+    if device == "auto":
+        return accelerator_device.AUTO
+    return accelerator_device.CPU
+
+
+def looks_garbled(text: str) -> bool:
+    cleaned = text.replace("<!-- image -->", "").strip()
+    if len(cleaned) < 80:
+        return False
+
+    sample = cleaned[:4000]
+    visible_chars = [ch for ch in sample if not ch.isspace()]
+    if not visible_chars:
+        return False
+
+    suspicious = sum(1 for ch in visible_chars if is_suspicious_char(ch))
+    cjk = sum(1 for ch in visible_chars if "\u4e00" <= ch <= "\u9fff")
+    ascii_letters = sum(1 for ch in visible_chars if ch.isascii() and ch.isalpha())
+    digits = sum(1 for ch in visible_chars if ch.isdigit())
+    normal = cjk + ascii_letters + digits
+
+    suspicious_ratio = suspicious / len(visible_chars)
+    normal_ratio = normal / len(visible_chars)
+    return suspicious_ratio > 0.2 and normal_ratio < 0.35
+
+
+def is_suspicious_char(ch: str) -> bool:
+    code = ord(ch)
+    if code < 32 or code == 127:
+        return True
+    if 0x80 <= code <= 0x9F:
+        return True
+    if 0x0100 <= code <= 0x024F:
+        return True
+    if 0x0370 <= code <= 0x052F:
+        return True
+    return False
+
+
+def resolve_suffix(file_name: str | None, source_url: str) -> str:
+    candidate = file_name or unquote(Path(urlparse(source_url).path).name)
+    suffix = Path(candidate).suffix.lower()
+    if suffix and len(suffix) <= 12:
+        return suffix
+    return ".bin"
