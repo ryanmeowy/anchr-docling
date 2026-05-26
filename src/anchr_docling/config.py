@@ -15,9 +15,17 @@ class Settings(BaseSettings):
         alias="ANCHR_DOCLING_READ_TIMEOUT_SECONDS",
     )
     device: str = Field(default="cpu", alias="ANCHR_DOCLING_DEVICE")
-    ocr_engines: str = Field(default="ocrmac,rapidocr", alias="ANCHR_DOCLING_OCR_ENGINES")
+    ocr_engines: str = Field(
+        default="ocrmac,rapidocr",
+        alias="ANCHR_DOCLING_OCR_ENGINES",
+    )
     ocr_lang: str = Field(default="chinese", alias="ANCHR_DOCLING_OCR_LANG")
-    force_full_page_ocr: bool = Field(default=True, alias="ANCHR_DOCLING_FORCE_FULL_PAGE_OCR")
+    force_full_page_ocr: bool = Field(
+        default=True,
+        alias="ANCHR_DOCLING_FORCE_FULL_PAGE_OCR",
+    )
+    preload_models: bool = Field(default=True, alias="ANCHR_DOCLING_PRELOAD_MODELS")
+    preload_ocr_models: bool = Field(default=False, alias="ANCHR_DOCLING_PRELOAD_OCR_MODELS")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

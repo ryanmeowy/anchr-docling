@@ -1,12 +1,28 @@
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from anchr_docling.docling_parser import DoclingParseError, DoclingParser, SourceDownloadError
+from anchr_docling.config import settings
+from anchr_docling.docling_parser import (
+    DoclingParseError,
+    DoclingParser,
+    SourceDownloadError,
+)
 from anchr_docling.schemas import ParseRequest, ParseResponse
 
-app = FastAPI(title="anchr-docling", version="0.1.0")
 parser = DoclingParser()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if settings.preload_models:
+        await asyncio.to_thread(parser.preload)
+    yield
+
+
+app = FastAPI(title="anchr-docling", version="0.1.0", lifespan=lifespan)
 
 
 @app.get("/healthz")

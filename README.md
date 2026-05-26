@@ -21,6 +21,23 @@ some PDF conversion paths with unsupported `float64` tensors. You can override i
 export ANCHR_DOCLING_DEVICE=cpu
 ```
 
+By default, startup prefetches Docling's PDF layout/table model artifacts through
+Docling's official `docling.utils.model_downloader.download_models()` API and initializes
+the default converter before the first parse request. Disable this if the runtime should
+start without touching the model cache or network:
+
+```bash
+export ANCHR_DOCLING_PRELOAD_MODELS=false
+```
+
+OCR model prefetching is disabled by default because OCR is only used when `"ocr": true`
+or OCR fallback is triggered. Enable it when you want startup to also prepare configured
+OCR engines:
+
+```bash
+export ANCHR_DOCLING_PRELOAD_OCR_MODELS=true
+```
+
 ## API
 
 Health check:
