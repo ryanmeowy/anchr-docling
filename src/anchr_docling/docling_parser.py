@@ -1,13 +1,22 @@
+import logging
 import os
 import platform
 import tempfile
+import threading
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 import httpx
 
 from anchr_docling.config import settings
-from anchr_docling.schemas import ParseOptions, ParseRequest, ParseResponse
+from anchr_docling.schemas import (
+    OutputFormat,
+    ParsedPage,
+    ParseOptions,
+    ParseRequest,
+    ParseResponse,
+)
 
 
 class SourceDownloadError(RuntimeError):
@@ -18,20 +27,41 @@ class DoclingParseError(RuntimeError):
     pass
 
 
+_log = logging.getLogger(__name__)
+_converter_lock = threading.Lock()
+_converters: dict[tuple[bool, str | None, bool], Any] = {}
+_preloaded_artifacts_path: Path | None = None
+
+
+class ParsedDocument:
+    def __init__(
+        self,
+        text: str | dict[str, Any],
+        pages: list[ParsedPage],
+        quality_text: str,
+    ) -> None:
+        self.text = text
+        self.pages = pages
+        self.quality_text = quality_text
+
+
 class DoclingParser:
+    def preload(self) -> None:
+        preload_docling_models()
+
     def parse(self, request: ParseRequest) -> ParseResponse:
         suffix = resolve_suffix(request.file_name, str(request.source_url))
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
-            text = convert_to_markdown(source_path, request.options)
+            parsed = convert_document(source_path, request.options)
 
         return ParseResponse(
             requestId=request.request_id,
             parser="docling",
-            format="markdown",
-            text=text,
-            pages=[],
+            format=request.options.output_format,
+            text=parsed.text,
+            pages=parsed.pages,
         )
 
 
@@ -50,7 +80,13 @@ def download_source(source_url: str, target_path: Path) -> None:
 
     total = 0
     try:
-        with httpx.stream("GET", source_url, headers=headers, follow_redirects=True, timeout=timeout) as response:
+        with httpx.stream(
+            "GET",
+            source_url,
+            headers=headers,
+            follow_redirects=True,
+            timeout=timeout,
+        ) as response:
             response.raise_for_status()
             with target_path.open("wb") as output:
                 for chunk in response.iter_bytes():
@@ -68,20 +104,16 @@ def download_source(source_url: str, target_path: Path) -> None:
         raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
 
 
-def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
+def convert_document(source_path: Path, options: ParseOptions) -> ParsedDocument:
     try:
+        components = load_docling_components()
         configure_torch_device()
-        from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
-        from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import (
             EasyOcrOptions,
             OcrMacOptions,
-            PdfPipelineOptions,
             RapidOcrOptions,
             TesseractOcrOptions,
         )
-        from docling.document_converter import DocumentConverter
-        from docling.document_converter import PdfFormatOption
     except ImportError as exc:
         raise DoclingParseError("docling is not installed") from exc
 
@@ -92,15 +124,10 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
             "rapidocr": RapidOcrOptions,
             "tesseract": TesseractOcrOptions,
         }
-        text = run_docling_convert(
+        parsed = run_docling_convert(
             source_path,
             options,
-            PdfPipelineOptions,
-            AcceleratorOptions,
-            AcceleratorDevice,
-            DocumentConverter,
-            InputFormat,
-            PdfFormatOption,
+            components,
             ocr_options_by_engine,
             ocr=options.ocr,
             ocr_engine=first_configured_ocr_engine(),
@@ -108,111 +135,138 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
         if (
             options.validate_text_quality
             and not options.ocr
-            and looks_garbled(text)
+            and looks_garbled(parsed.quality_text)
             and options.ocr_fallback
         ):
-            text = run_ocr_fallback_chain(
+            parsed = run_ocr_fallback_chain(
                 source_path,
                 options,
-                PdfPipelineOptions,
-                AcceleratorOptions,
-                AcceleratorDevice,
-                DocumentConverter,
-                InputFormat,
-                PdfFormatOption,
+                components,
                 ocr_options_by_engine,
             )
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
 
-    if not text or not text.strip():
+    if not parsed.quality_text or not parsed.quality_text.strip():
         raise DoclingParseError("docling returned empty content")
-    if options.validate_text_quality and looks_garbled(text):
+    if options.validate_text_quality and looks_garbled(parsed.quality_text):
         raise DoclingParseError(
             "docling returned garbled text. The PDF may use custom font encoding; retry with "
             "`ocrFallback: true` or `ocr: true`."
         )
-    return text.strip()
+    if isinstance(parsed.text, str):
+        parsed.text = parsed.text.strip()
+    return parsed
 
 
 def run_docling_convert(
     source_path: Path,
     options: ParseOptions,
-    pdf_pipeline_options: type,
-    accelerator_options: type,
-    accelerator_device: type,
-    document_converter: type,
-    input_format: type,
-    pdf_format_option: type,
+    components: dict[str, Any],
     ocr_options_by_engine: dict[str, type],
     *,
     ocr: bool,
     ocr_engine: str | None,
-) -> str:
-    pipeline_options = pdf_pipeline_options()
-    pipeline_options.accelerator_options = accelerator_options(
-        num_threads=4,
-        device=resolve_accelerator_device(accelerator_device),
-    )
-    pipeline_options.do_ocr = ocr
-    pipeline_options.force_backend_text = not ocr
-    if ocr:
-        if ocr_engine is None:
-            raise DoclingParseError("OCR engine is required when OCR is enabled")
-        pipeline_options.ocr_options = build_ocr_options(ocr_options_by_engine, ocr_engine)
-    pipeline_options.do_table_structure = options.table_structure
-    pipeline_options.do_picture_classification = False
-    pipeline_options.do_picture_description = False
-    pipeline_options.do_code_enrichment = False
-    pipeline_options.do_formula_enrichment = False
-    pipeline_options.generate_page_images = False
-    pipeline_options.generate_picture_images = False
-    pipeline_options.generate_table_images = False
-    converter = document_converter(
-        format_options={
-            input_format.PDF: pdf_format_option(pipeline_options=pipeline_options),
-        }
+) -> ParsedDocument:
+    converter = get_document_converter(
+        options,
+        components,
+        ocr_options_by_engine,
+        ocr=ocr,
+        ocr_engine=ocr_engine,
     )
     result = converter.convert(source_path)
-    return result.document.export_to_markdown()
+    return export_parsed_document(result.document, options.output_format)
 
 
 def run_ocr_fallback_chain(
     source_path: Path,
     options: ParseOptions,
-    pdf_pipeline_options: type,
-    accelerator_options: type,
-    accelerator_device: type,
-    document_converter: type,
-    input_format: type,
-    pdf_format_option: type,
+    components: dict[str, Any],
     ocr_options_by_engine: dict[str, type],
-) -> str:
+) -> ParsedDocument:
     errors: list[str] = []
     for engine in configured_ocr_engines():
         try:
-            text = run_docling_convert(
+            parsed = run_docling_convert(
                 source_path,
                 options,
-                pdf_pipeline_options,
-                accelerator_options,
-                accelerator_device,
-                document_converter,
-                input_format,
-                pdf_format_option,
+                components,
                 ocr_options_by_engine,
                 ocr=True,
                 ocr_engine=engine,
             )
-            if text and text.strip() and not looks_garbled(text):
-                return text
+            if (
+                parsed.quality_text
+                and parsed.quality_text.strip()
+                and not looks_garbled(parsed.quality_text)
+            ):
+                return parsed
             errors.append(f"{engine}: empty or garbled OCR result")
         except Exception as exc:
             errors.append(f"{engine}: {exc}")
     raise DoclingParseError("all OCR engines failed; " + " | ".join(errors))
 
 
-def build_ocr_options(ocr_options_by_engine: dict[str, type], engine: str) -> object:
+def export_parsed_document(document: Any, output_format: OutputFormat) -> ParsedDocument:
+    json_document = document.export_to_dict() if output_format == "json" else None
+    text = export_document_content(document, output_format, json_document=json_document)
+    pages = [
+        ParsedPage(
+            pageNo=page_no,
+            text=export_page_content(
+                document,
+                output_format,
+                page_no,
+                json_document=json_document,
+            ),
+        )
+        for page_no in sorted(document.pages)
+    ]
+    return ParsedDocument(text=text, pages=pages, quality_text=document.export_to_text())
+
+
+def export_document_content(
+    document: Any,
+    output_format: OutputFormat,
+    *,
+    json_document: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    if output_format == "markdown":
+        return document.export_to_markdown()
+    if output_format == "html":
+        return document.export_to_html()
+    if output_format == "text":
+        return document.export_to_text()
+    if output_format == "json":
+        return json_document if json_document is not None else document.export_to_dict()
+    raise DoclingParseError(f"unsupported output format: {output_format}")
+
+
+def export_page_content(
+    document: Any,
+    output_format: OutputFormat,
+    page_no: int,
+    *,
+    json_document: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    if output_format == "markdown":
+        return document.export_to_markdown(page_no=page_no).strip()
+    if output_format == "html":
+        return document.export_to_html(page_no=page_no).strip()
+    if output_format == "text":
+        return document.export_to_text(page_no=page_no).strip()
+    if output_format == "json":
+        doc = json_document if json_document is not None else document.export_to_dict()
+        pages = doc.get("pages", {})
+        return pages.get(str(page_no)) or pages.get(page_no) or {}
+    raise DoclingParseError(f"unsupported output format: {output_format}")
+
+
+def build_ocr_options(
+    ocr_options_by_engine: dict[str, type],
+    engine: str,
+) -> object:
     options_class = ocr_options_by_engine.get(engine)
     if options_class is None:
         raise DoclingParseError(f"unsupported OCR engine: {engine}")
@@ -225,8 +279,170 @@ def build_ocr_options(ocr_options_by_engine: dict[str, type], engine: str) -> ob
     return options
 
 
+def preload_docling_models() -> None:
+    global _preloaded_artifacts_path
+
+    try:
+        configure_torch_device()
+        components = load_docling_components()
+        ocr_options_by_engine = load_ocr_option_classes()
+        default_options = ParseOptions()
+        _preloaded_artifacts_path = prefetch_docling_model_artifacts(default_options)
+        get_document_converter(
+            default_options,
+            components,
+            ocr_options_by_engine,
+            ocr=False,
+            ocr_engine=first_configured_ocr_engine(),
+        )
+        if settings.preload_ocr_models:
+            for engine in configured_ocr_engines():
+                get_document_converter(
+                    default_options,
+                    components,
+                    ocr_options_by_engine,
+                    ocr=True,
+                    ocr_engine=engine,
+                )
+        _log.info("Docling model preload completed")
+    except ImportError as exc:
+        raise DoclingParseError("docling is not installed") from exc
+
+
+def prefetch_docling_model_artifacts(default_options: ParseOptions) -> Path:
+    from docling.datamodel.settings import settings as docling_settings
+    from docling.utils.model_downloader import download_models
+
+    engines = set(configured_ocr_engines()) if settings.preload_ocr_models else set()
+    return download_models(
+        output_dir=docling_settings.artifacts_path,
+        progress=False,
+        with_layout=True,
+        with_tableformer=default_options.table_structure,
+        with_tableformer_v2=False,
+        with_code_formula=False,
+        with_picture_classifier=False,
+        with_smolvlm=False,
+        with_granitedocling=False,
+        with_granitedocling_mlx=False,
+        with_granitedocling_2stage=False,
+        with_smoldocling=False,
+        with_smoldocling_mlx=False,
+        with_granite_vision=False,
+        with_granite_chart_extraction=False,
+        with_granite_chart_extraction_v4=False,
+        with_rapidocr="rapidocr" in engines,
+        with_easyocr="easyocr" in engines,
+    )
+
+
+def load_docling_components() -> dict[str, Any]:
+    from docling.datamodel.accelerator_options import (
+        AcceleratorDevice,
+        AcceleratorOptions,
+    )
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+
+    return {
+        "AcceleratorDevice": AcceleratorDevice,
+        "AcceleratorOptions": AcceleratorOptions,
+        "DocumentConverter": DocumentConverter,
+        "InputFormat": InputFormat,
+        "PdfFormatOption": PdfFormatOption,
+        "PdfPipelineOptions": PdfPipelineOptions,
+    }
+
+
+def load_ocr_option_classes() -> dict[str, type]:
+    from docling.datamodel.pipeline_options import (
+        EasyOcrOptions,
+        OcrMacOptions,
+        RapidOcrOptions,
+        TesseractOcrOptions,
+    )
+
+    return {
+        "easyocr": EasyOcrOptions,
+        "ocrmac": OcrMacOptions,
+        "rapidocr": RapidOcrOptions,
+        "tesseract": TesseractOcrOptions,
+    }
+
+
+def get_document_converter(
+    options: ParseOptions,
+    components: dict[str, Any],
+    ocr_options_by_engine: dict[str, type],
+    *,
+    ocr: bool,
+    ocr_engine: str | None,
+) -> Any:
+    cache_key = (ocr, ocr_engine if ocr else None, options.table_structure)
+    with _converter_lock:
+        converter = _converters.get(cache_key)
+        if converter is None:
+            converter = build_document_converter(
+                options,
+                components,
+                ocr_options_by_engine,
+                ocr=ocr,
+                ocr_engine=ocr_engine,
+            )
+            converter.initialize_pipeline(components["InputFormat"].PDF)
+            _converters[cache_key] = converter
+        return converter
+
+
+def build_document_converter(
+    options: ParseOptions,
+    components: dict[str, Any],
+    ocr_options_by_engine: dict[str, type],
+    *,
+    ocr: bool,
+    ocr_engine: str | None,
+) -> Any:
+    pipeline_options = components["PdfPipelineOptions"]()
+    if _preloaded_artifacts_path is not None:
+        pipeline_options.artifacts_path = _preloaded_artifacts_path
+    pipeline_options.accelerator_options = components["AcceleratorOptions"](
+        num_threads=4,
+        device=resolve_accelerator_device(components["AcceleratorDevice"]),
+    )
+    pipeline_options.do_ocr = ocr
+    pipeline_options.force_backend_text = not ocr
+    if ocr:
+        if ocr_engine is None:
+            raise DoclingParseError("OCR engine is required when OCR is enabled")
+        pipeline_options.ocr_options = build_ocr_options(
+            ocr_options_by_engine,
+            ocr_engine,
+        )
+    pipeline_options.do_table_structure = options.table_structure
+    pipeline_options.do_picture_classification = False
+    pipeline_options.do_picture_description = False
+    pipeline_options.do_code_enrichment = False
+    pipeline_options.do_formula_enrichment = False
+    pipeline_options.generate_page_images = False
+    pipeline_options.generate_picture_images = False
+    pipeline_options.generate_table_images = False
+
+    return components["DocumentConverter"](
+        format_options={
+            components["InputFormat"].PDF: components["PdfFormatOption"](
+                pipeline_options=pipeline_options
+            ),
+        }
+    )
+
+
 def configured_ocr_engines() -> list[str]:
-    engines = [item.strip().lower() for item in settings.ocr_engines.split(",") if item.strip()]
+    engines = [
+        item.strip().lower()
+        for item in settings.ocr_engines.split(",")
+        if item.strip()
+    ]
     if engines:
         return engines
     if platform.system() == "Darwin":
