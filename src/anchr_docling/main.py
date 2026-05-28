@@ -30,7 +30,7 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/v1/parse", response_model=ParseResponse)
+@app.post("/v1/parse", response_model=ParseResponse, response_model_exclude_none=True)
 async def parse_document(request: ParseRequest) -> ParseResponse:
     try:
         return await asyncio.to_thread(parser.parse, request)

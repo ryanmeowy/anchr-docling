@@ -7,10 +7,10 @@ default response format, and `outputFormat=json` exposes Docling's structured do
 model. The next useful step is to add a stable application-facing projection that is
 easier for callers to index, render, and attach media to.
 
-## 1. Add `outputFormat=blocks`
+## 1. `outputFormat=blocks`
 
-This is feasible and should be implemented as a projection over Docling's document
-model, not as a direct pass-through of raw Docling JSON.
+Implemented as a projection over Docling's document model, not as a direct
+pass-through of raw Docling JSON.
 
 Suggested response shape:
 
@@ -66,10 +66,10 @@ Notes:
   blocks back to raw JSON when needed.
 - For pictures, aggregate captions and picture-child text into `childrenText`.
 
-## 2. Fix JSON Mode `pages`
+## 2. JSON Mode `pages`
 
-Current `json` mode should not put the raw Docling page object into `pages[].text`.
-That makes the field name misleading and forces callers to special-case it.
+Implemented so that `pages[].text` is page text, not the raw Docling page object.
+The full Docling JSON object is exposed through the top-level `document` field.
 
 Recommended response shape:
 
@@ -88,12 +88,12 @@ Recommended response shape:
 }
 ```
 
-Recommended behavior:
+Current behavior:
 
 - `text` should always mean text.
-- `document` should contain the full Docling JSON object in `json` mode.
-- `pages[].text` should be page-level aggregated text.
-- `pages[].blockRefs` should list refs for blocks appearing on the page.
+- `document` contains the full Docling JSON object in `json` mode.
+- `pages[].text` contains page-level aggregated text.
+- `pages[].blockRefs` lists refs for blocks appearing on the page.
 
 This keeps the response easier to consume and avoids overloading `text` with both
 strings and objects.
@@ -137,9 +137,6 @@ Upload contract options:
 
 Recommended sequence:
 
-1. Implement `outputFormat=blocks`.
-2. Fix `json` mode page text and add `blockRefs`.
-3. Add image metadata to picture blocks with `imageKey: null`.
-4. Define the Spring Boot upload-signature endpoint.
-5. Enable Docling image generation and upload extracted picture images to OSS.
-
+1. Add image metadata to picture blocks with `imageKey: null`.
+2. Define the Spring Boot upload-signature endpoint.
+3. Enable Docling image generation and upload extracted picture images to OSS.
