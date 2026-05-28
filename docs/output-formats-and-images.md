@@ -100,16 +100,67 @@ strings and objects.
 
 ## 3. Image Export and OSS Upload
 
-Image export is feasible, but it is a larger feature than the output-format changes
-because it needs a sidecar-to-Spring Boot upload contract.
+Image export requires the sidecar to upload extracted images to OSS so callers can
+reference them via a stable key.
+
+### Recommended approach: STS token
+
+Spring Boot issues a temporary STS token (or pre-signed base URL) before calling the
+sidecar and passes it as part of the parse request. The sidecar uses the token to upload
+images directly to OSS — no callback to Spring Boot is needed.
+
+```
+Spring Boot ──签发 STS token──→ OSS
+Spring Boot ──POST /v1/parse (含 token)──→ docling
+docling ──直接上传图片 (用 token)──→ OSS
+docling ──返回含 imageKey 的结果──→ Spring Boot
+```
+
+Why this is simpler than the alternatives:
+
+- **No reverse dependency**: the sidecar does not need to know Spring Boot's address.
+- **No per-image round-trip**: uploads happen inline during parsing, no extra network calls.
+- **Token is self-contained**: the sidecar only needs an OSS endpoint, bucket name, and
+  the STS token — all of which Spring Boot already knows and can pass in one request.
+
+ParseRequest addition — OSS credentials are encrypted by Spring Boot before
+transmission. The sidecar decrypts them with a private key loaded from its
+environment at startup.
+
+```json
+{
+  "sourceUrl": "...",
+  "options": {},
+  "oss": {
+    "endpoint": "https://oss-cn-hangzhou.aliyuncs.com",
+    "bucket": "anchr-documents",
+    "encryptedCredentials": "base64-encoded ciphertext",
+    "basePath": "images/2024/"
+  }
+}
+```
+
+Encryption contract:
+
+- A shared AES key (e.g. 256-bit) is configured on both sides. The sidecar loads it
+  from `ANCHR_DOCLING_OSS_ENCRYPT_KEY` at startup; Spring Boot loads it from its own
+  configuration.
+- Before calling the sidecar, Spring Boot encrypts the STS credentials (token + access
+  key + secret key, serialized as JSON) with AES-GCM, producing a single
+  `encryptedCredentials` ciphertext (base64-encoded).
+- The sidecar decrypts `encryptedCredentials` with the same key at parse time and
+  uses the resulting STS credentials to upload directly to OSS.
+- No plaintext credentials ever appear in an HTTP body.
 
 Docling side:
 
+- Load the shared AES key from `ANCHR_DOCLING_OSS_ENCRYPT_KEY` env var at startup.
 - Enable page image generation in the PDF pipeline with `generate_page_images=True`.
 - Use `PictureItem.get_image(doc)` to crop picture images from page images.
-- Encode or save each image as PNG/JPEG.
-- Upload the image using a signed OSS upload target from Spring Boot.
-- Return the resulting `imageKey` on the matching picture block.
+- Encode each image as PNG/JPEG.
+- Decrypt `encryptedCredentials` from the request, then upload via OSS SDK using the
+  decrypted STS credentials.
+- Store the resulting `imageKey` on the matching picture block.
 
 Suggested picture block:
 
@@ -120,23 +171,27 @@ Suggested picture block:
   "pageNo": 1,
   "bbox": {},
   "childrenText": [],
-  "imageKey": "oss/path/to/image.png"
+  "imageKey": "images/2024/abc123.png"
 }
 ```
 
-Upload contract options:
+### Alternative upload contracts (rejected)
 
-- Spring Boot pre-signs a fixed list of upload URLs before parsing.
-  This is simple, but the image count is unknown before parsing, so it can over- or
-  under-allocate.
-- Sidecar calls Spring Boot when it discovers an image and requests an upload target.
-  This is the recommended approach. Spring Boot returns `uploadUrl`, `imageKey`, and
-  any required headers.
-- Sidecar returns image bytes or base64 to Spring Boot and lets Spring Boot upload.
-  This is easiest to implement but can make parse responses very large.
+- **Spring Boot pre-signs a fixed list of upload URLs before parsing.**
+  Simple, but the image count is unknown before parsing — easy to over- or under-allocate.
+- **Sidecar calls Spring Boot when it discovers an image and requests an upload target.**
+  Creates a reverse dependency (docling → Spring Boot) and adds per-image network latency.
+  Avoided by the STS-token approach above.
+- **Sidecar returns image bytes or base64 to Spring Boot and lets Spring Boot upload.**
+  Easiest to implement but makes parse responses very large; still a reasonable fallback
+  for small documents or prototyping.
 
-Recommended sequence:
+### Recommended sequence
 
-1. Add image metadata to picture blocks with `imageKey: null`.
-2. Define the Spring Boot upload-signature endpoint.
-3. Enable Docling image generation and upload extracted picture images to OSS.
+1. Generate an AES-256 key and configure `ANCHR_DOCLING_OSS_ENCRYPT_KEY` on the sidecar;
+   configure the same key on the Spring Boot side.
+2. Add `oss` fields to `ParseRequest` schema (optional, so existing callers are unaffected).
+3. Add image metadata to picture blocks with `imageKey: null` (no upload yet).
+4. Enable Docling image generation (`generate_page_images=True`).
+5. Implement OSS upload in the sidecar: decrypt credentials, then upload using the
+   decrypted STS token.
