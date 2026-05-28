@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from anchr_docling.config import settings
-from anchr_docling.schemas import ParseOptions, ParseRequest, ParseResponse
+from anchr_docling.schemas import ParsedPage, ParseOptions, ParseRequest, ParseResponse
 
 
 class SourceDownloadError(RuntimeError):
@@ -27,6 +27,12 @@ _converters: dict[tuple[bool, str | None, bool], Any] = {}
 _preloaded_artifacts_path: Path | None = None
 
 
+class ParsedDocument:
+    def __init__(self, text: str, pages: list[ParsedPage]) -> None:
+        self.text = text
+        self.pages = pages
+
+
 class DoclingParser:
     def preload(self) -> None:
         preload_docling_models()
@@ -36,14 +42,14 @@ class DoclingParser:
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
-            text = convert_to_markdown(source_path, request.options)
+            parsed = convert_to_markdown(source_path, request.options)
 
         return ParseResponse(
             requestId=request.request_id,
             parser="docling",
             format="markdown",
-            text=text,
-            pages=[],
+            text=parsed.text,
+            pages=parsed.pages,
         )
 
 
@@ -86,7 +92,7 @@ def download_source(source_url: str, target_path: Path) -> None:
         raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
 
 
-def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
+def convert_to_markdown(source_path: Path, options: ParseOptions) -> ParsedDocument:
     try:
         components = load_docling_components()
         configure_torch_device()
@@ -106,7 +112,7 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
             "rapidocr": RapidOcrOptions,
             "tesseract": TesseractOcrOptions,
         }
-        text = run_docling_convert(
+        parsed = run_docling_convert(
             source_path,
             options,
             components,
@@ -117,10 +123,10 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
         if (
             options.validate_text_quality
             and not options.ocr
-            and looks_garbled(text)
+            and looks_garbled(parsed.text)
             and options.ocr_fallback
         ):
-            text = run_ocr_fallback_chain(
+            parsed = run_ocr_fallback_chain(
                 source_path,
                 options,
                 components,
@@ -129,14 +135,15 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> str:
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
 
-    if not text or not text.strip():
+    if not parsed.text or not parsed.text.strip():
         raise DoclingParseError("docling returned empty content")
-    if options.validate_text_quality and looks_garbled(text):
+    if options.validate_text_quality and looks_garbled(parsed.text):
         raise DoclingParseError(
             "docling returned garbled text. The PDF may use custom font encoding; retry with "
             "`ocrFallback: true` or `ocr: true`."
         )
-    return text.strip()
+    parsed.text = parsed.text.strip()
+    return parsed
 
 
 def run_docling_convert(
@@ -147,7 +154,7 @@ def run_docling_convert(
     *,
     ocr: bool,
     ocr_engine: str | None,
-) -> str:
+) -> ParsedDocument:
     converter = get_document_converter(
         options,
         components,
@@ -156,7 +163,7 @@ def run_docling_convert(
         ocr_engine=ocr_engine,
     )
     result = converter.convert(source_path)
-    return result.document.export_to_markdown()
+    return export_parsed_document(result.document)
 
 
 def run_ocr_fallback_chain(
@@ -164,11 +171,11 @@ def run_ocr_fallback_chain(
     options: ParseOptions,
     components: dict[str, Any],
     ocr_options_by_engine: dict[str, type],
-) -> str:
+) -> ParsedDocument:
     errors: list[str] = []
     for engine in configured_ocr_engines():
         try:
-            text = run_docling_convert(
+            parsed = run_docling_convert(
                 source_path,
                 options,
                 components,
@@ -176,12 +183,24 @@ def run_ocr_fallback_chain(
                 ocr=True,
                 ocr_engine=engine,
             )
-            if text and text.strip() and not looks_garbled(text):
-                return text
+            if parsed.text and parsed.text.strip() and not looks_garbled(parsed.text):
+                return parsed
             errors.append(f"{engine}: empty or garbled OCR result")
         except Exception as exc:
             errors.append(f"{engine}: {exc}")
     raise DoclingParseError("all OCR engines failed; " + " | ".join(errors))
+
+
+def export_parsed_document(document: Any) -> ParsedDocument:
+    text = document.export_to_markdown()
+    pages = [
+        ParsedPage(
+            pageNo=page_no,
+            text=document.export_to_markdown(page_no=page_no).strip(),
+        )
+        for page_no in sorted(document.pages)
+    ]
+    return ParsedDocument(text=text, pages=pages)
 
 
 def build_ocr_options(ocr_options_by_engine: dict[str, type], engine: str) -> object:

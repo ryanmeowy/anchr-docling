@@ -73,7 +73,12 @@ Response:
   "parser": "docling",
   "format": "markdown",
   "text": "# Parsed document\n...",
-  "pages": []
+  "pages": [
+    {
+      "pageNo": 1,
+      "text": "# Parsed document\n..."
+    }
+  ]
 }
 ```
 
