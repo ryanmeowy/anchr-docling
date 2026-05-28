@@ -10,7 +10,13 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from anchr_docling.config import settings
-from anchr_docling.schemas import ParsedPage, ParseOptions, ParseRequest, ParseResponse
+from anchr_docling.schemas import (
+    OutputFormat,
+    ParsedPage,
+    ParseOptions,
+    ParseRequest,
+    ParseResponse,
+)
 
 
 class SourceDownloadError(RuntimeError):
@@ -28,9 +34,15 @@ _preloaded_artifacts_path: Path | None = None
 
 
 class ParsedDocument:
-    def __init__(self, text: str, pages: list[ParsedPage]) -> None:
+    def __init__(
+        self,
+        text: str | dict[str, Any],
+        pages: list[ParsedPage],
+        quality_text: str,
+    ) -> None:
         self.text = text
         self.pages = pages
+        self.quality_text = quality_text
 
 
 class DoclingParser:
@@ -42,12 +54,12 @@ class DoclingParser:
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
-            parsed = convert_to_markdown(source_path, request.options)
+            parsed = convert_document(source_path, request.options)
 
         return ParseResponse(
             requestId=request.request_id,
             parser="docling",
-            format="markdown",
+            format=request.options.output_format,
             text=parsed.text,
             pages=parsed.pages,
         )
@@ -92,7 +104,7 @@ def download_source(source_url: str, target_path: Path) -> None:
         raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
 
 
-def convert_to_markdown(source_path: Path, options: ParseOptions) -> ParsedDocument:
+def convert_document(source_path: Path, options: ParseOptions) -> ParsedDocument:
     try:
         components = load_docling_components()
         configure_torch_device()
@@ -123,7 +135,7 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> ParsedDocum
         if (
             options.validate_text_quality
             and not options.ocr
-            and looks_garbled(parsed.text)
+            and looks_garbled(parsed.quality_text)
             and options.ocr_fallback
         ):
             parsed = run_ocr_fallback_chain(
@@ -135,14 +147,15 @@ def convert_to_markdown(source_path: Path, options: ParseOptions) -> ParsedDocum
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
 
-    if not parsed.text or not parsed.text.strip():
+    if not parsed.quality_text or not parsed.quality_text.strip():
         raise DoclingParseError("docling returned empty content")
-    if options.validate_text_quality and looks_garbled(parsed.text):
+    if options.validate_text_quality and looks_garbled(parsed.quality_text):
         raise DoclingParseError(
             "docling returned garbled text. The PDF may use custom font encoding; retry with "
             "`ocrFallback: true` or `ocr: true`."
         )
-    parsed.text = parsed.text.strip()
+    if isinstance(parsed.text, str):
+        parsed.text = parsed.text.strip()
     return parsed
 
 
@@ -163,7 +176,7 @@ def run_docling_convert(
         ocr_engine=ocr_engine,
     )
     result = converter.convert(source_path)
-    return export_parsed_document(result.document)
+    return export_parsed_document(result.document, options.output_format)
 
 
 def run_ocr_fallback_chain(
@@ -183,7 +196,11 @@ def run_ocr_fallback_chain(
                 ocr=True,
                 ocr_engine=engine,
             )
-            if parsed.text and parsed.text.strip() and not looks_garbled(parsed.text):
+            if (
+                parsed.quality_text
+                and parsed.quality_text.strip()
+                and not looks_garbled(parsed.quality_text)
+            ):
                 return parsed
             errors.append(f"{engine}: empty or garbled OCR result")
         except Exception as exc:
@@ -191,19 +208,65 @@ def run_ocr_fallback_chain(
     raise DoclingParseError("all OCR engines failed; " + " | ".join(errors))
 
 
-def export_parsed_document(document: Any) -> ParsedDocument:
-    text = document.export_to_markdown()
+def export_parsed_document(document: Any, output_format: OutputFormat) -> ParsedDocument:
+    json_document = document.export_to_dict() if output_format == "json" else None
+    text = export_document_content(document, output_format, json_document=json_document)
     pages = [
         ParsedPage(
             pageNo=page_no,
-            text=document.export_to_markdown(page_no=page_no).strip(),
+            text=export_page_content(
+                document,
+                output_format,
+                page_no,
+                json_document=json_document,
+            ),
         )
         for page_no in sorted(document.pages)
     ]
-    return ParsedDocument(text=text, pages=pages)
+    return ParsedDocument(text=text, pages=pages, quality_text=document.export_to_text())
 
 
-def build_ocr_options(ocr_options_by_engine: dict[str, type], engine: str) -> object:
+def export_document_content(
+    document: Any,
+    output_format: OutputFormat,
+    *,
+    json_document: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    if output_format == "markdown":
+        return document.export_to_markdown()
+    if output_format == "html":
+        return document.export_to_html()
+    if output_format == "text":
+        return document.export_to_text()
+    if output_format == "json":
+        return json_document if json_document is not None else document.export_to_dict()
+    raise DoclingParseError(f"unsupported output format: {output_format}")
+
+
+def export_page_content(
+    document: Any,
+    output_format: OutputFormat,
+    page_no: int,
+    *,
+    json_document: dict[str, Any] | None = None,
+) -> str | dict[str, Any]:
+    if output_format == "markdown":
+        return document.export_to_markdown(page_no=page_no).strip()
+    if output_format == "html":
+        return document.export_to_html(page_no=page_no).strip()
+    if output_format == "text":
+        return document.export_to_text(page_no=page_no).strip()
+    if output_format == "json":
+        doc = json_document if json_document is not None else document.export_to_dict()
+        pages = doc.get("pages", {})
+        return pages.get(str(page_no)) or pages.get(page_no) or {}
+    raise DoclingParseError(f"unsupported output format: {output_format}")
+
+
+def build_ocr_options(
+    ocr_options_by_engine: dict[str, type],
+    engine: str,
+) -> object:
     options_class = ocr_options_by_engine.get(engine)
     if options_class is None:
         raise DoclingParseError(f"unsupported OCR engine: {engine}")

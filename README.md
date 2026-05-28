@@ -82,6 +82,10 @@ Response:
 }
 ```
 
+`outputFormat` supports `markdown`, `html`, `text`, and `json`. For `json`, the
+`text` field contains Docling's structured JSON object, and each `pages[].text`
+contains the corresponding page object from Docling's JSON output.
+
 ## Notes
 
 - This project intentionally does not own storage, tasks, database state, or chunk persistence.
