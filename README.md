@@ -82,9 +82,15 @@ Response:
 }
 ```
 
-`outputFormat` supports `markdown`, `html`, `text`, and `json`. For `json`, the
-`text` field contains Docling's structured JSON object, and each `pages[].text`
-contains the corresponding page object from Docling's JSON output.
+`outputFormat` supports `markdown`, `html`, `text`, `json`, and `blocks`.
+
+For `json`, `text` contains aggregated document text, `document` contains Docling's
+structured JSON object, and each page includes page text plus `blockRefs`.
+
+For `blocks`, `text` contains aggregated document text, `blocks` contains an
+application-facing block list, and each page includes page text plus `blockRefs`.
+Picture blocks include `imageKey: null`; OSS upload integration is intentionally not
+implemented yet.
 
 ## Notes
 

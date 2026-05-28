@@ -3,8 +3,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 
-OutputFormat = Literal["markdown", "html", "text", "json"]
-FormattedContent = str | dict[str, Any]
+OutputFormat = Literal["markdown", "html", "text", "json", "blocks"]
 
 
 class ParseOptions(BaseModel):
@@ -32,12 +31,15 @@ class ParseRequest(BaseModel):
 
 class ParsedPage(BaseModel):
     page_no: int | None = Field(default=None, alias="pageNo")
-    text: FormattedContent
+    text: str
+    block_refs: list[str] | None = Field(default=None, alias="blockRefs")
 
 
 class ParseResponse(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     parser: str
     format: str
-    text: FormattedContent
+    text: str
     pages: list[ParsedPage] = Field(default_factory=list)
+    document: dict[str, Any] | None = None
+    blocks: list[dict[str, Any]] | None = None

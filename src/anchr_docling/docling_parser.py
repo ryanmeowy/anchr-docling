@@ -36,13 +36,17 @@ _preloaded_artifacts_path: Path | None = None
 class ParsedDocument:
     def __init__(
         self,
-        text: str | dict[str, Any],
+        text: str,
         pages: list[ParsedPage],
         quality_text: str,
+        document: dict[str, Any] | None = None,
+        blocks: list[dict[str, Any]] | None = None,
     ) -> None:
         self.text = text
         self.pages = pages
         self.quality_text = quality_text
+        self.document = document
+        self.blocks = blocks
 
 
 class DoclingParser:
@@ -62,6 +66,8 @@ class DoclingParser:
             format=request.options.output_format,
             text=parsed.text,
             pages=parsed.pages,
+            document=parsed.document,
+            blocks=parsed.blocks,
         )
 
 
@@ -210,7 +216,9 @@ def run_ocr_fallback_chain(
 
 def export_parsed_document(document: Any, output_format: OutputFormat) -> ParsedDocument:
     json_document = document.export_to_dict() if output_format == "json" else None
-    text = export_document_content(document, output_format, json_document=json_document)
+    blocks = export_blocks(document) if output_format == "blocks" else None
+    page_block_refs = collect_page_block_refs(document) if output_format in {"json", "blocks"} else {}
+    text = export_document_content(document, output_format)
     pages = [
         ParsedPage(
             pageNo=page_no,
@@ -218,28 +226,30 @@ def export_parsed_document(document: Any, output_format: OutputFormat) -> Parsed
                 document,
                 output_format,
                 page_no,
-                json_document=json_document,
             ),
+            blockRefs=page_block_refs.get(page_no),
         )
         for page_no in sorted(document.pages)
     ]
-    return ParsedDocument(text=text, pages=pages, quality_text=document.export_to_text())
+    return ParsedDocument(
+        text=text,
+        pages=pages,
+        quality_text=document.export_to_text(),
+        document=json_document,
+        blocks=blocks,
+    )
 
 
 def export_document_content(
     document: Any,
     output_format: OutputFormat,
-    *,
-    json_document: dict[str, Any] | None = None,
-) -> str | dict[str, Any]:
+) -> str:
     if output_format == "markdown":
         return document.export_to_markdown()
     if output_format == "html":
         return document.export_to_html()
-    if output_format == "text":
+    if output_format in {"text", "json", "blocks"}:
         return document.export_to_text()
-    if output_format == "json":
-        return json_document if json_document is not None else document.export_to_dict()
     raise DoclingParseError(f"unsupported output format: {output_format}")
 
 
@@ -247,20 +257,165 @@ def export_page_content(
     document: Any,
     output_format: OutputFormat,
     page_no: int,
-    *,
-    json_document: dict[str, Any] | None = None,
-) -> str | dict[str, Any]:
+) -> str:
     if output_format == "markdown":
         return document.export_to_markdown(page_no=page_no).strip()
     if output_format == "html":
         return document.export_to_html(page_no=page_no).strip()
-    if output_format == "text":
-        return document.export_to_text(page_no=page_no).strip()
-    if output_format == "json":
-        doc = json_document if json_document is not None else document.export_to_dict()
-        pages = doc.get("pages", {})
-        return pages.get(str(page_no)) or pages.get(page_no) or {}
+    if output_format in {"text", "json", "blocks"}:
+        return document.export_to_text(page_no=page_no, traverse_pictures=True).strip()
     raise DoclingParseError(f"unsupported output format: {output_format}")
+
+
+def export_blocks(document: Any) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for item, _ in document.iterate_items(with_groups=True, traverse_pictures=True):
+        ref = getattr(item, "self_ref", None)
+        if not ref or ref == "#/body":
+            continue
+
+        block = {
+            "blockId": ref_to_block_id(ref),
+            "type": resolve_block_type(item),
+        }
+        add_if_present(block, "text", getattr(item, "text", None))
+        if block["type"] == "group":
+            add_if_present(block, "label", enum_value(getattr(item, "label", None)))
+        add_if_present(block, "pageNo", resolve_page_no(document, item))
+        add_if_present(block, "parentRef", resolve_parent_ref(item))
+        add_if_present(block, "bbox", resolve_bbox(item))
+
+        child_refs = resolve_child_refs(item)
+        if child_refs:
+            block["children"] = child_refs
+
+        if resolve_block_type(item) == "picture":
+            block["childrenText"] = collect_child_text(document, item)
+            block["imageKey"] = None
+
+        blocks.append(block)
+    return blocks
+
+
+def collect_page_block_refs(document: Any) -> dict[int, list[str]]:
+    refs_by_page: dict[int, list[str]] = {}
+    for item, _ in document.iterate_items(with_groups=True, traverse_pictures=True):
+        ref = getattr(item, "self_ref", None)
+        if not ref or ref == "#/body":
+            continue
+
+        page_no = resolve_page_no(document, item)
+        if page_no is None:
+            continue
+
+        refs = refs_by_page.setdefault(page_no, [])
+        if ref not in refs:
+            refs.append(ref)
+    return refs_by_page
+
+
+def resolve_block_type(item: Any) -> str:
+    ref = getattr(item, "self_ref", "")
+    if ref.startswith("#/groups/"):
+        return "group"
+    return enum_value(getattr(item, "label", None)) or ref.split("/")[1].rstrip("s")
+
+
+def resolve_page_no(document: Any, item: Any) -> int | None:
+    prov = getattr(item, "prov", None)
+    if prov:
+        return getattr(prov[0], "page_no", None)
+
+    for child_ref in getattr(item, "children", []) or []:
+        child = resolve_ref(document, child_ref)
+        if child is None:
+            continue
+        page_no = resolve_page_no(document, child)
+        if page_no is not None:
+            return page_no
+    return None
+
+
+def resolve_bbox(item: Any) -> dict[str, Any] | None:
+    prov = getattr(item, "prov", None)
+    if not prov:
+        return None
+    bbox = getattr(prov[0], "bbox", None)
+    if bbox is None:
+        return None
+    if hasattr(bbox, "model_dump"):
+        return bbox.model_dump(mode="json")
+    if isinstance(bbox, dict):
+        return bbox
+    return None
+
+
+def resolve_parent_ref(item: Any) -> str | None:
+    parent = getattr(item, "parent", None)
+    return getattr(parent, "cref", None)
+
+
+def resolve_child_refs(item: Any) -> list[str]:
+    return [
+        ref
+        for child in getattr(item, "children", []) or []
+        if (ref := getattr(child, "cref", None))
+    ]
+
+
+def collect_child_text(document: Any, item: Any) -> list[str]:
+    texts: list[str] = []
+    seen_refs: set[str] = set()
+    for ref_item in [
+        *(getattr(item, "captions", []) or []),
+        *(getattr(item, "children", []) or []),
+    ]:
+        collect_ref_text(document, ref_item, texts, seen_refs)
+    return texts
+
+
+def collect_ref_text(
+    document: Any,
+    ref_item: Any,
+    texts: list[str],
+    seen_refs: set[str],
+) -> None:
+    ref = getattr(ref_item, "cref", None)
+    if not ref or ref in seen_refs:
+        return
+    seen_refs.add(ref)
+
+    item = resolve_ref(document, ref_item)
+    if item is None:
+        return
+
+    text = getattr(item, "text", None)
+    if text:
+        texts.append(text)
+    for child in getattr(item, "children", []) or []:
+        collect_ref_text(document, child, texts, seen_refs)
+
+
+def resolve_ref(document: Any, ref_item: Any) -> Any | None:
+    try:
+        return ref_item.resolve(document)
+    except Exception:
+        return None
+
+
+def ref_to_block_id(ref: str) -> str:
+    return ref.removeprefix("#/")
+
+
+def enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return getattr(value, "value", str(value))
+
+
+def add_if_present(target: dict[str, Any], key: str, value: Any) -> None:
+    if value is not None:
+        target[key] = value
 
 
 def build_ocr_options(
