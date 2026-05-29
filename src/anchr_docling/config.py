@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     )
     preload_models: bool = Field(default=True, alias="ANCHR_DOCLING_PRELOAD_MODELS")
     preload_ocr_models: bool = Field(default=False, alias="ANCHR_DOCLING_PRELOAD_OCR_MODELS")
+    oss_encrypt_key: str = Field(default="", alias="ANCHR_DOCLING_OSS_ENCRYPT_KEY")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 OutputFormat = Literal["markdown", "html", "text", "json", "blocks"]
@@ -13,6 +13,8 @@ class ParseOptions(BaseModel):
     table_structure: bool = True
     validate_text_quality: bool = Field(default=True, alias="validateTextQuality")
 
+    model_config = ConfigDict(populate_by_name=True)
+
     @field_validator("output_format", mode="before")
     @classmethod
     def normalize_output_format(cls, value: object) -> object:
@@ -21,18 +23,46 @@ class ParseOptions(BaseModel):
         return value
 
 
+class EncryptedCredentials(BaseModel):
+    iv: str
+    ciphertext: str
+    tag: str
+
+
+class OssUploadOptions(BaseModel):
+    endpoint: str
+    bucket: str
+    base_path: str = Field(default="", alias="basePath")
+    encrypted_credentials: EncryptedCredentials = Field(alias="encryptedCredentials")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ParseRequest(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     source_url: HttpUrl = Field(alias="sourceUrl")
     file_name: str | None = Field(default=None, alias="fileName")
     mime_type: str | None = Field(default=None, alias="mimeType")
     options: ParseOptions = Field(default_factory=ParseOptions)
+    oss: OssUploadOptions | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ParsedPage(BaseModel):
     page_no: int | None = Field(default=None, alias="pageNo")
     text: str
     block_refs: list[str] | None = Field(default=None, alias="blockRefs")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ParseWarning(BaseModel):
+    code: str
+    message: str
+    block_id: str | None = Field(default=None, alias="blockId")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ParseResponse(BaseModel):
@@ -43,3 +73,6 @@ class ParseResponse(BaseModel):
     pages: list[ParsedPage] = Field(default_factory=list)
     document: dict[str, Any] | None = None
     blocks: list[dict[str, Any]] | None = None
+    warnings: list[ParseWarning] | None = None
+
+    model_config = ConfigDict(populate_by_name=True)

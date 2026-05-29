@@ -1,8 +1,12 @@
+import base64
+import json
 import logging
 import os
 import platform
 import tempfile
 import threading
+from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -11,11 +15,14 @@ import httpx
 
 from anchr_docling.config import settings
 from anchr_docling.schemas import (
+    EncryptedCredentials,
+    OssUploadOptions,
     OutputFormat,
     ParsedPage,
     ParseOptions,
     ParseRequest,
     ParseResponse,
+    ParseWarning,
 )
 
 
@@ -24,6 +31,10 @@ class SourceDownloadError(RuntimeError):
 
 
 class DoclingParseError(RuntimeError):
+    pass
+
+
+class ImageUploadError(RuntimeError):
     pass
 
 
@@ -41,12 +52,29 @@ class ParsedDocument:
         quality_text: str,
         document: dict[str, Any] | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        warnings: list[ParseWarning] | None = None,
     ) -> None:
         self.text = text
         self.pages = pages
         self.quality_text = quality_text
         self.document = document
         self.blocks = blocks
+        self.warnings = warnings or []
+
+
+@dataclass(frozen=True)
+class OssCredentials:
+    access_key_id: str
+    access_key_secret: str
+    security_token: str
+    expiration: str | None = None
+
+
+@dataclass
+class ImageUploadContext:
+    uploader: "OssImageUploader | None"
+    unavailable_code: str | None = None
+    unavailable_message: str | None = None
 
 
 class DoclingParser:
@@ -58,7 +86,7 @@ class DoclingParser:
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
-            parsed = convert_document(source_path, request.options)
+            parsed = convert_document(source_path, request.options, request.oss)
 
         return ParseResponse(
             requestId=request.request_id,
@@ -68,6 +96,7 @@ class DoclingParser:
             pages=parsed.pages,
             document=parsed.document,
             blocks=parsed.blocks,
+            warnings=parsed.warnings or None,
         )
 
 
@@ -110,7 +139,11 @@ def download_source(source_url: str, target_path: Path) -> None:
         raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
 
 
-def convert_document(source_path: Path, options: ParseOptions) -> ParsedDocument:
+def convert_document(
+    source_path: Path,
+    options: ParseOptions,
+    oss_options: OssUploadOptions | None,
+) -> ParsedDocument:
     try:
         components = load_docling_components()
         configure_torch_device()
@@ -137,6 +170,7 @@ def convert_document(source_path: Path, options: ParseOptions) -> ParsedDocument
             ocr_options_by_engine,
             ocr=options.ocr,
             ocr_engine=first_configured_ocr_engine(),
+            oss_options=oss_options,
         )
         if (
             options.validate_text_quality
@@ -149,6 +183,7 @@ def convert_document(source_path: Path, options: ParseOptions) -> ParsedDocument
                 options,
                 components,
                 ocr_options_by_engine,
+                oss_options,
             )
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
@@ -173,6 +208,7 @@ def run_docling_convert(
     *,
     ocr: bool,
     ocr_engine: str | None,
+    oss_options: OssUploadOptions | None,
 ) -> ParsedDocument:
     converter = get_document_converter(
         options,
@@ -182,7 +218,7 @@ def run_docling_convert(
         ocr_engine=ocr_engine,
     )
     result = converter.convert(source_path)
-    return export_parsed_document(result.document, options.output_format)
+    return export_parsed_document(result.document, options.output_format, oss_options)
 
 
 def run_ocr_fallback_chain(
@@ -190,6 +226,7 @@ def run_ocr_fallback_chain(
     options: ParseOptions,
     components: dict[str, Any],
     ocr_options_by_engine: dict[str, type],
+    oss_options: OssUploadOptions | None,
 ) -> ParsedDocument:
     errors: list[str] = []
     for engine in configured_ocr_engines():
@@ -201,6 +238,7 @@ def run_ocr_fallback_chain(
                 ocr_options_by_engine,
                 ocr=True,
                 ocr_engine=engine,
+                oss_options=oss_options,
             )
             if (
                 parsed.quality_text
@@ -214,10 +252,28 @@ def run_ocr_fallback_chain(
     raise DoclingParseError("all OCR engines failed; " + " | ".join(errors))
 
 
-def export_parsed_document(document: Any, output_format: OutputFormat) -> ParsedDocument:
+def export_parsed_document(
+    document: Any,
+    output_format: OutputFormat,
+    oss_options: OssUploadOptions | None = None,
+) -> ParsedDocument:
     json_document = document.export_to_dict() if output_format == "json" else None
-    blocks = export_blocks(document) if output_format == "blocks" else None
-    page_block_refs = collect_page_block_refs(document) if output_format in {"json", "blocks"} else {}
+    warnings: list[ParseWarning] = []
+    upload_context = (
+        build_image_upload_context(oss_options, warnings)
+        if output_format == "blocks"
+        else None
+    )
+    blocks = (
+        export_blocks(document, upload_context, warnings)
+        if output_format == "blocks"
+        else None
+    )
+    page_block_refs = (
+        collect_page_block_refs(document)
+        if output_format in {"json", "blocks"}
+        else {}
+    )
     text = export_document_content(document, output_format)
     pages = [
         ParsedPage(
@@ -237,6 +293,7 @@ def export_parsed_document(document: Any, output_format: OutputFormat) -> Parsed
         quality_text=document.export_to_text(),
         document=json_document,
         blocks=blocks,
+        warnings=warnings,
     )
 
 
@@ -267,7 +324,11 @@ def export_page_content(
     raise DoclingParseError(f"unsupported output format: {output_format}")
 
 
-def export_blocks(document: Any) -> list[dict[str, Any]]:
+def export_blocks(
+    document: Any,
+    upload_context: ImageUploadContext | None,
+    warnings: list[ParseWarning],
+) -> list[dict[str, Any]]:
     blocks: list[dict[str, Any]] = []
     for item, _ in document.iterate_items(with_groups=True, traverse_pictures=True):
         ref = getattr(item, "self_ref", None)
@@ -291,10 +352,235 @@ def export_blocks(document: Any) -> list[dict[str, Any]]:
 
         if resolve_block_type(item) == "picture":
             block["childrenText"] = collect_child_text(document, item)
-            block["imageKey"] = None
+            attach_picture_image_metadata(document, item, block, upload_context, warnings)
 
         blocks.append(block)
     return blocks
+
+
+def build_image_upload_context(
+    oss_options: OssUploadOptions | None,
+    warnings: list[ParseWarning],
+) -> ImageUploadContext:
+    if oss_options is None:
+        return ImageUploadContext(
+            uploader=None,
+            unavailable_code="image_upload_skipped_no_credentials",
+            unavailable_message="OSS credentials were not provided; image upload was skipped.",
+        )
+
+    try:
+        credentials = decrypt_oss_credentials(oss_options.encrypted_credentials)
+        return ImageUploadContext(
+            uploader=OssImageUploader(
+                endpoint=oss_options.endpoint,
+                bucket_name=oss_options.bucket,
+                base_path=oss_options.base_path,
+                credentials=credentials,
+            )
+        )
+    except Exception as exc:
+        message = sanitize_error_message(exc)
+        add_warning(
+            warnings,
+            code="image_upload_failed",
+            message=f"OSS credentials could not be decrypted: {message}",
+        )
+        return ImageUploadContext(
+            uploader=None,
+            unavailable_code="image_upload_failed",
+            unavailable_message="OSS credentials could not be decrypted.",
+        )
+
+
+def attach_picture_image_metadata(
+    document: Any,
+    item: Any,
+    block: dict[str, Any],
+    upload_context: ImageUploadContext | None,
+    warnings: list[ParseWarning],
+) -> None:
+    block_id = block["blockId"]
+    block["imageKey"] = None
+    block["imageUploadStatus"] = "no_image"
+    block["imageUploadError"] = None
+
+    image = get_picture_image(document, item)
+    if image is None:
+        return
+
+    block["imageMimeType"] = "image/png"
+    block["imageWidth"], block["imageHeight"] = image.size
+
+    if upload_context is None or upload_context.uploader is None:
+        code = (
+            upload_context.unavailable_code
+            if upload_context is not None and upload_context.unavailable_code is not None
+            else "image_upload_skipped_no_credentials"
+        )
+        message = (
+            upload_context.unavailable_message
+            if upload_context is not None and upload_context.unavailable_message is not None
+            else "OSS credentials were not provided; image upload was skipped."
+        )
+        block["imageUploadStatus"] = (
+            "skipped_no_credentials"
+            if code == "image_upload_skipped_no_credentials"
+            else "failed"
+        )
+        if block["imageUploadStatus"] == "failed":
+            block["imageUploadError"] = message
+        add_warning(warnings, code=code, message=message, block_id=block_id)
+        return
+
+    try:
+        image_key = upload_context.uploader.upload_png(block_id, image)
+        block["imageKey"] = image_key
+        block["imageUploadStatus"] = "uploaded"
+    except Exception:
+        message = "Failed to upload image to OSS."
+        block["imageUploadStatus"] = "failed"
+        block["imageUploadError"] = message
+        add_warning(
+            warnings,
+            code="image_upload_failed",
+            message=message,
+            block_id=block_id,
+        )
+
+
+def get_picture_image(document: Any, item: Any) -> Any | None:
+    get_image = getattr(item, "get_image", None)
+    if get_image is None:
+        return None
+    try:
+        return get_image(doc=document)
+    except Exception:
+        return None
+
+
+class OssImageUploader:
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        bucket_name: str,
+        base_path: str,
+        credentials: OssCredentials,
+    ) -> None:
+        self.endpoint = endpoint
+        self.bucket_name = bucket_name
+        self.base_path = base_path.strip("/")
+        self.credentials = credentials
+
+    def upload_png(self, block_id: str, image: Any) -> str:
+        try:
+            import oss2
+        except ImportError as exc:
+            raise ImageUploadError("oss2 is not installed") from exc
+
+        image_key = self.build_image_key(block_id)
+        content = encode_png(image)
+        auth = oss2.StsAuth(
+            self.credentials.access_key_id,
+            self.credentials.access_key_secret,
+            self.credentials.security_token,
+        )
+        bucket = oss2.Bucket(auth, self.endpoint, self.bucket_name)
+        bucket.put_object(image_key, content, headers={"Content-Type": "image/png"})
+        return image_key
+
+    def build_image_key(self, block_id: str) -> str:
+        filename = block_id.replace("/", "_") + ".png"
+        if not self.base_path:
+            return filename
+        return f"{self.base_path}/{filename}"
+
+
+def encode_png(image: Any) -> bytes:
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
+
+
+def decrypt_oss_credentials(encrypted: EncryptedCredentials) -> OssCredentials:
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError as exc:
+        raise ImageUploadError("cryptography is not installed") from exc
+
+    key = load_oss_encrypt_key()
+    iv = decode_base64_field(encrypted.iv, "iv")
+    ciphertext = decode_base64_field(encrypted.ciphertext, "ciphertext")
+    tag = decode_base64_field(encrypted.tag, "tag")
+    if len(iv) != 12:
+        raise ImageUploadError("encrypted credentials iv must be 12 bytes")
+    if len(tag) != 16:
+        raise ImageUploadError("encrypted credentials tag must be 16 bytes")
+
+    plaintext = AESGCM(key).decrypt(iv, ciphertext + tag, None)
+    payload = json.loads(plaintext.decode("utf-8"))
+    return OssCredentials(
+        access_key_id=require_string(payload, "accessKeyId"),
+        access_key_secret=require_string(payload, "accessKeySecret"),
+        security_token=require_string(payload, "securityToken"),
+        expiration=payload.get("expiration"),
+    )
+
+
+def load_oss_encrypt_key() -> bytes:
+    configured = settings.oss_encrypt_key.strip()
+    if not configured:
+        raise ImageUploadError("OSS encryption key is not configured")
+
+    try:
+        decoded = base64.b64decode(configured, validate=True)
+        if len(decoded) == 32:
+            return decoded
+    except Exception:
+        pass
+
+    raw = configured.encode("utf-8")
+    if len(raw) != 32:
+        raise ImageUploadError(
+            "OSS encryption key must be 32 bytes or base64-encoded 32 bytes"
+        )
+    return raw
+
+
+def decode_base64_field(value: str, field_name: str) -> bytes:
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as exc:
+        raise ImageUploadError(
+            f"encrypted credentials {field_name} is not valid base64"
+        ) from exc
+
+
+def require_string(payload: dict[str, Any], field_name: str) -> str:
+    value = payload.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ImageUploadError(f"encrypted credentials missing {field_name}")
+    return value
+
+
+def add_warning(
+    warnings: list[ParseWarning],
+    *,
+    code: str,
+    message: str,
+    block_id: str | None = None,
+) -> None:
+    warning = ParseWarning(code=code, message=message, block_id=block_id)
+    if warning not in warnings:
+        warnings.append(warning)
+
+
+def sanitize_error_message(exc: Exception) -> str:
+    message = str(exc).strip()
+    if not message:
+        return exc.__class__.__name__
+    return message[:200]
 
 
 def collect_page_block_refs(document: Any) -> dict[int, list[str]]:
@@ -579,7 +865,7 @@ def build_document_converter(
     pipeline_options.do_picture_description = False
     pipeline_options.do_code_enrichment = False
     pipeline_options.do_formula_enrichment = False
-    pipeline_options.generate_page_images = False
+    pipeline_options.generate_page_images = True
     pipeline_options.generate_picture_images = False
     pipeline_options.generate_table_images = False
 
