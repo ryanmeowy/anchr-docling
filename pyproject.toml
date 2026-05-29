@@ -4,10 +4,12 @@ version = "0.1.0"
 description = "Docling sidecar service for Anchr document parsing."
 requires-python = ">=3.11"
 dependencies = [
+    "cryptography>=42.0.0",
     "docling>=2.58.0",
     "transformers>=5.8.1,<5.9.0",
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
+    "oss2>=2.18.0",
     "ocrmac>=1.0.0; platform_system == 'Darwin'",
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
