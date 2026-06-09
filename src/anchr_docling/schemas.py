@@ -3,7 +3,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
-OutputFormat = Literal["markdown", "html", "text", "json", "blocks"]
+OutputFormat = Literal["markdown", "html", "text", "json", "blocks", "chunks"]
+ChunkOcrPolicy = Literal["exclude", "include"]
 
 
 class ParseOptions(BaseModel):
@@ -12,6 +13,9 @@ class ParseOptions(BaseModel):
     ocr_fallback: bool = Field(default=False, alias="ocrFallback")
     table_structure: bool = True
     validate_text_quality: bool = Field(default=True, alias="validateTextQuality")
+    chunk_target_chars: int = Field(default=800, alias="chunkTargetChars")
+    chunk_max_chars: int = Field(default=1200, alias="chunkMaxChars")
+    chunk_ocr_policy: ChunkOcrPolicy = Field(default="exclude", alias="chunkOcrPolicy")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -26,7 +30,7 @@ class ParseOptions(BaseModel):
 class EncryptedCredentials(BaseModel):
     iv: str
     ciphertext: str
-    tag: str
+    tag: str | None = None
 
 
 class OssUploadOptions(BaseModel):
@@ -52,7 +56,6 @@ class ParseRequest(BaseModel):
 class ParsedPage(BaseModel):
     page_no: int | None = Field(default=None, alias="pageNo")
     text: str
-    block_refs: list[str] | None = Field(default=None, alias="blockRefs")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -73,6 +76,8 @@ class ParseResponse(BaseModel):
     pages: list[ParsedPage] = Field(default_factory=list)
     document: dict[str, Any] | None = None
     blocks: list[dict[str, Any]] | None = None
+    chunks: list[dict[str, Any]] | None = None
+    images: list[dict[str, Any]] | None = None
     warnings: list[ParseWarning] | None = None
 
     model_config = ConfigDict(populate_by_name=True)

@@ -5,6 +5,7 @@ import os
 import platform
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -50,15 +51,21 @@ class ParsedDocument:
         text: str,
         pages: list[ParsedPage],
         quality_text: str,
+        ocr_used: bool,
         document: dict[str, Any] | None = None,
         blocks: list[dict[str, Any]] | None = None,
+        chunks: list[dict[str, Any]] | None = None,
+        images: list[dict[str, Any]] | None = None,
         warnings: list[ParseWarning] | None = None,
     ) -> None:
         self.text = text
         self.pages = pages
         self.quality_text = quality_text
+        self.ocr_used = ocr_used
         self.document = document
         self.blocks = blocks
+        self.chunks = chunks
+        self.images = images
         self.warnings = warnings or []
 
 
@@ -86,7 +93,7 @@ class DoclingParser:
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
-            parsed = convert_document(source_path, request.options, request.oss)
+            parsed = convert_document(source_path, request.options, request.oss, request.request_id)
 
         return ParseResponse(
             requestId=request.request_id,
@@ -96,6 +103,8 @@ class DoclingParser:
             pages=parsed.pages,
             document=parsed.document,
             blocks=parsed.blocks,
+            chunks=parsed.chunks,
+            images=parsed.images,
             warnings=parsed.warnings or None,
         )
 
@@ -143,6 +152,7 @@ def convert_document(
     source_path: Path,
     options: ParseOptions,
     oss_options: OssUploadOptions | None,
+    request_id: str | None = None,
 ) -> ParsedDocument:
     try:
         components = load_docling_components()
@@ -171,6 +181,7 @@ def convert_document(
             ocr=options.ocr,
             ocr_engine=first_configured_ocr_engine(),
             oss_options=oss_options,
+            request_id=request_id,
         )
         if (
             options.validate_text_quality
@@ -184,6 +195,7 @@ def convert_document(
                 components,
                 ocr_options_by_engine,
                 oss_options,
+                request_id=request_id,
             )
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
@@ -209,6 +221,7 @@ def run_docling_convert(
     ocr: bool,
     ocr_engine: str | None,
     oss_options: OssUploadOptions | None,
+    request_id: str | None = None,
 ) -> ParsedDocument:
     converter = get_document_converter(
         options,
@@ -218,7 +231,13 @@ def run_docling_convert(
         ocr_engine=ocr_engine,
     )
     result = converter.convert(source_path)
-    return export_parsed_document(result.document, options.output_format, oss_options)
+    return export_parsed_document(
+        result.document,
+        options,
+        oss_options,
+        ocr_used=ocr,
+        request_id=request_id,
+    )
 
 
 def run_ocr_fallback_chain(
@@ -227,6 +246,7 @@ def run_ocr_fallback_chain(
     components: dict[str, Any],
     ocr_options_by_engine: dict[str, type],
     oss_options: OssUploadOptions | None,
+    request_id: str | None = None,
 ) -> ParsedDocument:
     errors: list[str] = []
     for engine in configured_ocr_engines():
@@ -239,6 +259,7 @@ def run_ocr_fallback_chain(
                 ocr=True,
                 ocr_engine=engine,
                 oss_options=oss_options,
+                request_id=request_id,
             )
             if (
                 parsed.quality_text
@@ -254,14 +275,18 @@ def run_ocr_fallback_chain(
 
 def export_parsed_document(
     document: Any,
-    output_format: OutputFormat,
+    options: ParseOptions,
     oss_options: OssUploadOptions | None = None,
+    *,
+    ocr_used: bool = False,
+    request_id: str | None = None,
 ) -> ParsedDocument:
+    output_format = options.output_format
     json_document = document.export_to_dict() if output_format == "json" else None
     warnings: list[ParseWarning] = []
     upload_context = (
-        build_image_upload_context(oss_options, warnings)
-        if output_format == "blocks"
+        build_image_upload_context(oss_options, warnings, request_id=request_id)
+        if output_format in {"blocks", "markdown", "chunks"}
         else None
     )
     blocks = (
@@ -269,12 +294,6 @@ def export_parsed_document(
         if output_format == "blocks"
         else None
     )
-    page_block_refs = (
-        collect_page_block_refs(document)
-        if output_format in {"json", "blocks"}
-        else {}
-    )
-    text = export_document_content(document, output_format)
     pages = [
         ParsedPage(
             pageNo=page_no,
@@ -283,16 +302,62 @@ def export_parsed_document(
                 output_format,
                 page_no,
             ),
-            blockRefs=page_block_refs.get(page_no),
         )
         for page_no in sorted(document.pages)
     ]
+    text = export_document_content(document, output_format)
+
+    # Enrich markdown output with OSS image URLs.
+    images: list[dict[str, Any]] | None = None
+    if output_format == "markdown" and upload_context is not None:
+        images = []
+        image_cache: dict[str, str | None] = {}
+        text = enrich_markdown_text(
+            document, text, upload_context, warnings, image_cache, images=images,
+        )
+        for page in pages:
+            if page.page_no is not None:
+                page.text = enrich_markdown_text(
+                    document, page.text, upload_context, warnings,
+                    image_cache, page_no=page.page_no, images=images,
+                )
+
+    chunks = (
+        export_markdown_chunks(text, pages, options, warnings)
+        if output_format == "chunks"
+        else None
+    )
+
+    # Enrich text + page text + chunk text with OSS image URLs.
+    if output_format == "chunks" and upload_context is not None:
+        if images is None:
+            images = []
+        image_cache: dict[str, str | None] = {}
+        text = enrich_markdown_text(
+            document, text, upload_context, warnings, image_cache, images=images,
+        )
+        for page in pages:
+            if page.page_no is not None:
+                page.text = enrich_markdown_text(
+                    document, page.text, upload_context, warnings,
+                    image_cache, page_no=page.page_no, images=images,
+                )
+        if chunks:
+            for chunk in chunks:
+                chunk["text"] = enrich_markdown_text(
+                    document, chunk["text"], upload_context, warnings,
+                    image_cache, images=images,
+                )
+
     return ParsedDocument(
         text=text,
         pages=pages,
         quality_text=document.export_to_text(),
+        ocr_used=ocr_used,
         document=json_document,
         blocks=blocks,
+        chunks=chunks,
+        images=images,
         warnings=warnings,
     )
 
@@ -301,7 +366,7 @@ def export_document_content(
     document: Any,
     output_format: OutputFormat,
 ) -> str:
-    if output_format == "markdown":
+    if output_format == "markdown" or output_format == "chunks":
         return document.export_to_markdown()
     if output_format == "html":
         return document.export_to_html()
@@ -315,7 +380,7 @@ def export_page_content(
     output_format: OutputFormat,
     page_no: int,
 ) -> str:
-    if output_format == "markdown":
+    if output_format == "markdown" or output_format == "chunks":
         return document.export_to_markdown(page_no=page_no).strip()
     if output_format == "html":
         return document.export_to_html(page_no=page_no).strip()
@@ -358,9 +423,236 @@ def export_blocks(
     return blocks
 
 
+def export_markdown_chunks(
+    full_text: str,
+    pages: list[ParsedPage],
+    options: ParseOptions,
+    warnings: list[ParseWarning],
+) -> list[dict[str, Any]]:
+    """Chunk markdown text with structure-aware splitting.
+
+    Headings (##/###) act as strong boundaries.  Tables and images are kept
+    intact.  Each chunk carries both the raw markdown (``text``, for LLM
+    consumption) and a plain-text variant (``textPlain``, for embedding).
+    """
+    target_chars = max(1, options.chunk_target_chars)
+    max_chars = max(target_chars, options.chunk_max_chars)
+
+    canonical = full_text.strip()
+    if not canonical:
+        return []
+
+    blocks = parse_markdown_blocks(canonical)
+    if not blocks:
+        return []
+
+    spans = _build_markdown_page_spans(canonical, pages)
+
+    chunks: list[dict[str, Any]] = []
+    current_blocks: list[dict[str, Any]] = []
+
+    def _cur_len() -> int:
+        return len(join_blocks_text(current_blocks))
+
+    for block in blocks:
+        cur_len = _cur_len()
+
+        # Table that exceeds max_chars on its own: emit as single chunk.
+        if block["type"] == "table" and len(block["text"]) > max_chars:
+            if current_blocks:
+                chunks.append(_build_md_chunk(len(chunks), current_blocks, spans))
+                current_blocks = []
+            chunks.append(_build_md_chunk(len(chunks), [block], spans))
+            continue
+
+        # Heading forces flush when we already have enough content.
+        if block["type"] == "heading" and cur_len >= target_chars:
+            chunks.append(_build_md_chunk(len(chunks), current_blocks, spans))
+            current_blocks = []
+
+        # Would overflow: flush current batch.
+        if current_blocks and cur_len + len(block["text"]) > max_chars and cur_len >= target_chars:
+            chunks.append(_build_md_chunk(len(chunks), current_blocks, spans))
+            current_blocks = []
+
+        current_blocks.append(block)
+
+    if current_blocks:
+        chunks.append(_build_md_chunk(len(chunks), current_blocks, spans))
+
+    for chunk in chunks:
+        chunk["source"] = "native"
+    return chunks
+
+
+def parse_markdown_blocks(md_text: str) -> list[dict[str, Any]]:
+    """Parse markdown text into typed logical blocks.
+
+    Returns blocks like:
+      {"type": "heading", "text": "## Overview", "level": 2, "offset": 42}
+      {"type": "paragraph", "text": "Some text.", "offset": 78}
+      …
+    ``offset`` is the byte position of the block's text within *md_text*.
+    """
+    parsed: list[dict[str, Any]] = []
+    pos = 0
+    n = len(md_text)
+
+    while pos < n:
+        # Skip leading whitespace between blocks.
+        while pos < n and md_text[pos] in ("\n", " ", "\t", "\r"):
+            pos += 1
+        if pos >= n:
+            break
+
+        # Find the next \n\n boundary.
+        end = md_text.find("\n\n", pos)
+        if end == -1:
+            end = n
+
+        block_text = md_text[pos:end].strip()
+        if not block_text:
+            pos = end + 2 if end < n else n
+            continue
+
+        line = block_text.split("\n", 1)[0]
+
+        if line.startswith("```"):
+            parsed.append({"type": "code", "text": block_text, "offset": pos})
+        elif line.startswith("<!-- image -->") or line.startswith("!["):
+            parsed.append({"type": "image", "text": block_text, "offset": pos})
+        elif line.startswith("|"):
+            parsed.append({"type": "table", "text": block_text, "offset": pos})
+        elif line.startswith("#"):
+            level = len(line) - len(line.lstrip("#"))
+            parsed.append({"type": "heading", "text": block_text, "level": level, "offset": pos})
+        elif line in ("---", "***", "___") or set(line) <= {"-", "*", "_", " "}:
+            pass  # horizontal rule – skip
+        elif line.startswith(("- ", "* ")) or (line[0].isdigit() and ". " in line[:4]):
+            parsed.append({"type": "list_item", "text": block_text, "offset": pos})
+        else:
+            parsed.append({"type": "paragraph", "text": block_text, "offset": pos})
+
+        pos = end + 2 if end < n else n
+
+    return parsed
+
+
+def join_blocks_text(blocks: list[dict[str, Any]]) -> str:
+    return "\n\n".join(b["text"] for b in blocks if b.get("text"))
+
+
+def _build_md_chunk(
+    index: int,
+    blocks: list[dict[str, Any]],
+    page_spans: list[dict[str, Any]],
+) -> dict[str, Any]:
+    md_text = join_blocks_text(blocks)
+    plain = strip_markdown(md_text)
+
+    chunk: dict[str, Any] = {
+        "chunkId": f"chunks/{index}",
+        "type": "section",
+        "text": md_text,
+        "textPlain": plain,
+        "charCount": len(md_text),
+    }
+
+    page_range = _resolve_chunk_page_range(blocks, page_spans)
+    if page_range is not None:
+        chunk["pageRange"] = page_range
+
+    return chunk
+
+
+def _build_markdown_page_spans(
+    full_text: str,
+    pages: list[ParsedPage],
+) -> list[dict[str, Any]]:
+    """Map page markdown texts to character offsets in the full markdown."""
+    spans: list[dict[str, Any]] = []
+    cursor = 0
+    for page in pages:
+        page_text = page.text.strip()
+        if not page_text:
+            continue
+        found = full_text.find(page_text, cursor)
+        if found >= 0:
+            start = found
+            end = found + len(page_text)
+        else:
+            start = min(cursor, len(full_text))
+            end = min(len(full_text), start + len(page_text))
+        spans.append(
+            {"start": start, "end": end, "pageNo": page.page_no}
+        )
+        cursor = end
+    return spans
+
+
+def _resolve_page_no(
+    offset: int,
+    page_spans: list[dict[str, Any]],
+) -> int | None:
+    """Return the page number for a character offset."""
+    for span in page_spans:
+        if span["start"] <= offset < span["end"]:
+            return span.get("pageNo")
+    if page_spans:
+        nearest = min(page_spans, key=lambda s: abs(s["start"] - offset))
+        return nearest.get("pageNo")
+    return None
+
+
+def _resolve_chunk_page_range(
+    blocks: list[dict[str, Any]],
+    page_spans: list[dict[str, Any]],
+) -> list[int] | None:
+    """Determine page range for a chunk from its blocks' offsets."""
+    page_nums: set[int] = set()
+    for block in blocks:
+        offset: int = block.get("offset", 0)
+        pn = _resolve_page_no(offset, page_spans)
+        if isinstance(pn, int):
+            page_nums.add(pn)
+    if not page_nums:
+        return None
+    return [min(page_nums), max(page_nums)]
+
+
+def strip_markdown(text: str) -> str:
+    """Strip markdown formatting to produce clean text for embedding."""
+    import re as _re
+
+    t = text
+    # Remove code fences with content
+    t = _re.sub(r"```[^`]*```", "", t)
+    # Remove images: ![alt](url) and <!-- image -->
+    t = _re.sub(r"!\[.*?\]\(.*?\)", "", t)
+    t = t.replace("<!-- image -->", "")
+    # Remove links, keep text: [text](url)
+    t = _re.sub(r"\[([^\]]*)\]\(.*?\)", r"\1", t)
+    # Strip heading markers
+    t = _re.sub(r"^#{1,6}\s+", "", t, flags=_re.MULTILINE)
+    # Bold / italic
+    t = _re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = _re.sub(r"__(.+?)__", r"\1", t)
+    t = _re.sub(r"\*(.+?)\*", r"\1", t)
+    t = _re.sub(r"_(.+?)_", r"\1", t)
+    # Inline code
+    t = _re.sub(r"`([^`]+)`", r"\1", t)
+    # Table formatting: strip pipes and alignment row
+    t = _re.sub(r"\|", " ", t)
+    t = _re.sub(r"\s{2,}", " ", t)
+    # Clean up blank lines
+    t = _re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
 def build_image_upload_context(
     oss_options: OssUploadOptions | None,
     warnings: list[ParseWarning],
+    request_id: str | None = None,
 ) -> ImageUploadContext:
     if oss_options is None:
         return ImageUploadContext(
@@ -377,6 +669,7 @@ def build_image_upload_context(
                 bucket_name=oss_options.bucket,
                 base_path=oss_options.base_path,
                 credentials=credentials,
+                request_id=request_id,
             )
         )
     except Exception as exc:
@@ -459,6 +752,123 @@ def get_picture_image(document: Any, item: Any) -> Any | None:
         return None
 
 
+def _get_picture_alt_text(document: Any, item: Any) -> str:
+    """Get alt text for a picture item.
+
+    Prefers the document caption via ``FloatingItem.caption_text``.
+    Falls back to collecting child/caption text (same logic as blocks mode).
+    """
+    caption_text_fn = getattr(item, "caption_text", None)
+    if caption_text_fn is not None:
+        try:
+            return caption_text_fn(document)
+        except Exception:
+            pass
+    texts = collect_child_text(document, item)
+    return texts[0] if texts else ""
+
+
+def enrich_markdown_text(
+    document: Any,
+    markdown_text: str,
+    upload_context: ImageUploadContext | None,
+    warnings: list[ParseWarning],
+    image_cache: dict[str, str | None],
+    page_no: int | None = None,
+    images: list[dict[str, Any]] | None = None,
+) -> str:
+    """Replace ``<!-- image -->`` placeholders with OSS-hosted markdown images.
+
+    Iterates pictures in document order, uploads them via the uploader,
+    and substitutes each placeholder sequentially.  A per-self-ref cache
+    avoids uploading the same picture more than once (shared between
+    document-level and per-page texts).
+
+    When *images* is provided, each picture is appended as a structured
+    dict (``url``, ``pageNo``, ``blockId``, ``alt``) for the top-level
+    ``images`` response field.
+    """
+    placeholder = "<!-- image -->"
+    if placeholder not in markdown_text:
+        return markdown_text
+
+    # Collect picture items in document traversal order,
+    # optionally filtered by page.
+    picture_items: list[tuple[Any, str]] = []
+    for item, _ in document.iterate_items(
+        with_groups=True, traverse_pictures=True
+    ):
+        ref = getattr(item, "self_ref", None)
+        if not ref or resolve_block_type(item) != "picture":
+            continue
+        if page_no is not None:
+            item_page_no = resolve_page_no(document, item)
+            if item_page_no != page_no:
+                continue
+        picture_items.append((item, ref_to_block_id(ref)))
+
+    if not picture_items:
+        return markdown_text
+
+    # Build ordered lists of alt texts and image URLs.
+    alt_texts: list[str] = []
+    image_urls: list[str | None] = []
+
+    for item, block_id in picture_items:
+        self_ref: str = getattr(item, "self_ref", "")
+
+        # Cache hit: reuse previously resolved URL (or None).
+        if self_ref in image_cache:
+            image_urls.append(image_cache[self_ref])
+            alt_texts.append(
+                image_cache.get(f"{self_ref}_alt", "") or ""
+            )
+            continue
+
+        alt_text = _get_picture_alt_text(document, item)
+        alt_texts.append(alt_text)
+        image_cache[f"{self_ref}_alt"] = alt_text
+
+        url: str | None = None
+        if upload_context is not None and upload_context.uploader is not None:
+            image = get_picture_image(document, item)
+            if image is not None:
+                try:
+                    image_key = upload_context.uploader.upload_png(
+                        block_id, image
+                    )
+                    url = upload_context.uploader.build_image_url(image_key)
+                except Exception:
+                    add_warning(
+                        warnings,
+                        code="image_upload_failed",
+                        message="Failed to upload image to OSS.",
+                        block_id=block_id,
+                    )
+
+        image_urls.append(url)
+        image_cache[self_ref] = url
+
+        if images is not None:
+            item_page_no = resolve_page_no(document, item)
+            images.append({
+                "url": url,
+                "pageNo": item_page_no,
+                "blockId": block_id,
+                "alt": alt_text,
+            })
+
+    # Replace placeholders one at a time, in order.
+    result = markdown_text
+    for url, alt in zip(image_urls, alt_texts):
+        if url is not None:
+            result = result.replace(
+                placeholder, f"![{alt}]({url})", 1
+            )
+
+    return result
+
+
 class OssImageUploader:
     def __init__(
         self,
@@ -467,11 +877,13 @@ class OssImageUploader:
         bucket_name: str,
         base_path: str,
         credentials: OssCredentials,
+        request_id: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.bucket_name = bucket_name
         self.base_path = base_path.strip("/")
         self.credentials = credentials
+        self.request_id = request_id
 
     def upload_png(self, block_id: str, image: Any) -> str:
         try:
@@ -491,10 +903,20 @@ class OssImageUploader:
         return image_key
 
     def build_image_key(self, block_id: str) -> str:
-        filename = block_id.replace("/", "_") + ".png"
+        suffix = self.request_id or str(int(time.time() * 1000))
+        safe_suffix = suffix.replace("/", "_").replace(":", "_")
+        stem = block_id.replace("/", "_")
+        filename = f"{stem}_{safe_suffix}.png"
         if not self.base_path:
             return filename
         return f"{self.base_path}/{filename}"
+
+    def build_image_url(self, image_key: str) -> str:
+        """Build the full OSS URL for an image key.
+
+        OSS URL format (virtual-hosted style): https://<bucket>.<endpoint>/<key>
+        """
+        return f"https://{self.bucket_name}.{self.endpoint}/{image_key}"
 
 
 def encode_png(image: Any) -> bytes:
@@ -505,20 +927,25 @@ def encode_png(image: Any) -> bytes:
 
 def decrypt_oss_credentials(encrypted: EncryptedCredentials) -> OssCredentials:
     try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives import padding
     except ImportError as exc:
         raise ImageUploadError("cryptography is not installed") from exc
 
     key = load_oss_encrypt_key()
     iv = decode_base64_field(encrypted.iv, "iv")
     ciphertext = decode_base64_field(encrypted.ciphertext, "ciphertext")
-    tag = decode_base64_field(encrypted.tag, "tag")
-    if len(iv) != 12:
-        raise ImageUploadError("encrypted credentials iv must be 12 bytes")
-    if len(tag) != 16:
-        raise ImageUploadError("encrypted credentials tag must be 16 bytes")
+    if len(iv) != 16:
+        raise ImageUploadError("encrypted credentials iv must be 16 bytes")
 
-    plaintext = AESGCM(key).decrypt(iv, ciphertext + tag, None)
+    decryptor = Cipher(
+        algorithms.AES256(key), modes.CBC(iv)
+    ).decryptor()
+
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    plaintext = unpadder.update(padded) + unpadder.finalize()
+
     payload = json.loads(plaintext.decode("utf-8"))
     return OssCredentials(
         access_key_id=require_string(payload, "accessKeyId"),
@@ -581,23 +1008,6 @@ def sanitize_error_message(exc: Exception) -> str:
     if not message:
         return exc.__class__.__name__
     return message[:200]
-
-
-def collect_page_block_refs(document: Any) -> dict[int, list[str]]:
-    refs_by_page: dict[int, list[str]] = {}
-    for item, _ in document.iterate_items(with_groups=True, traverse_pictures=True):
-        ref = getattr(item, "self_ref", None)
-        if not ref or ref == "#/body":
-            continue
-
-        page_no = resolve_page_no(document, item)
-        if page_no is None:
-            continue
-
-        refs = refs_by_page.setdefault(page_no, [])
-        if ref not in refs:
-            refs.append(ref)
-    return refs_by_page
 
 
 def resolve_block_type(item: Any) -> str:
