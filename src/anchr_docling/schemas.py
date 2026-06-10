@@ -4,7 +4,6 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 OutputFormat = Literal["markdown", "html", "text", "json", "blocks", "chunks"]
-ChunkOcrPolicy = Literal["exclude", "include"]
 
 
 class ParseOptions(BaseModel):
@@ -13,9 +12,9 @@ class ParseOptions(BaseModel):
     ocr_fallback: bool = Field(default=False, alias="ocrFallback")
     table_structure: bool = True
     validate_text_quality: bool = Field(default=True, alias="validateTextQuality")
-    chunk_target_chars: int = Field(default=800, alias="chunkTargetChars")
-    chunk_max_chars: int = Field(default=1200, alias="chunkMaxChars")
-    chunk_ocr_policy: ChunkOcrPolicy = Field(default="exclude", alias="chunkOcrPolicy")
+    chunk_min_tokens: int = Field(default=400, alias="chunkMinTokens")
+    chunk_max_tokens: int = Field(default=800, alias="chunkMaxTokens")
+    use_native_chunker: bool = Field(default=False, alias="useNativeChunker")
 
     model_config = ConfigDict(populate_by_name=True)
 
