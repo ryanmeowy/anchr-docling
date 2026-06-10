@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     preload_models: bool = Field(default=True, alias="ANCHR_DOCLING_PRELOAD_MODELS")
     preload_ocr_models: bool = Field(default=False, alias="ANCHR_DOCLING_PRELOAD_OCR_MODELS")
     oss_encrypt_key: str = Field(default="", alias="ANCHR_DOCLING_OSS_ENCRYPT_KEY")
+    max_image_megapixels: int = Field(
+        default=80,
+        alias="ANCHR_DOCLING_MAX_IMAGE_MEGAPIXELS",
+    )
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
