@@ -4,6 +4,7 @@ import platform
 import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from anchr_docling.config import settings
 from anchr_docling.errors import DoclingParseError
@@ -184,12 +185,18 @@ def build_document_converter(
     pipeline_options.generate_picture_images = False
     pipeline_options.generate_table_images = False
 
+    # Only PDF / IMAGE need PdfPipelineOptions.  MD, DOCX, HTML etc.
+    # work natively without pipeline configuration.
+    pdf_formats = {components["InputFormat"].PDF, components["InputFormat"].IMAGE}
+
     return components["DocumentConverter"](
         format_options={
             fmt: components["PdfFormatOption"](
                 pipeline_options=pipeline_options
             ),
         }
+        if fmt in pdf_formats
+        else {}
     )
 
 
@@ -301,5 +308,9 @@ def resolve_input_format(suffix: str) -> Any:
         return InputFormat.IMAGE
     if suffix == ".pdf":
         return InputFormat.PDF
+    if suffix == ".md":
+        return InputFormat.MD
+    if suffix == ".txt":
+        return None  # handled manually; skip Docling conversion
     # Fallback: treat unknown formats as PDF (Docling will try its best).
     return InputFormat.PDF
