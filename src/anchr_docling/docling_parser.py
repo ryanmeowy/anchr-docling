@@ -1,3 +1,4 @@
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -155,6 +156,49 @@ def convert_document(
 
     input_format = resolve_input_format(source_path.suffix.lower())
 
+    # Plain text / Markdown: build a minimal DoclingDocument manually.
+    # Only chunks output is supported for these formats.
+    is_md = source_path.suffix.lower() == ".md"
+    if input_format is None or is_md:
+        if options.output_format != "chunks":
+            suffix = source_path.suffix.lower()
+            raise DoclingParseError(
+                f"outputFormat must be 'chunks' for {suffix} input, "
+                f"got '{options.output_format}'"
+            )
+
+        text_content = source_path.read_text(encoding="utf-8")
+
+        # Extract image references from markdown before Docling parses it.
+        md_images = _extract_md_images(text_content) if is_md else []
+
+        try:
+            from docling_core.types.doc import DoclingDocument
+            from docling_core.types.doc.labels import DocItemLabel
+        except ImportError as exc:
+            raise DoclingParseError("docling is not installed") from exc
+
+        if is_md:
+            # Use Docling's MD converter for proper structure (headings, etc.).
+            components = load_docling_components()
+            converter = get_document_converter(
+                options, components, {}, ocr=False, ocr_engine=None,
+                input_format=resolve_input_format(".md"),
+            )
+            result = converter.convert(source_path)
+            doc = result.document
+        else:
+            doc = DoclingDocument(name=source_path.name)
+            for paragraph in text_content.split("\n\n"):
+                stripped = paragraph.strip()
+                if stripped:
+                    doc.add_text(text=stripped, label=DocItemLabel.TEXT)
+
+        return export_parsed_document(
+            doc, options, oss_options, request_id=request_id,
+            md_images=md_images,
+        )
+
     try:
         ocr_options_by_engine = {
             "easyocr": EasyOcrOptions,
@@ -201,6 +245,83 @@ def convert_document(
     if isinstance(parsed.text, str):
         parsed.text = parsed.text.strip()
     return parsed
+
+
+_MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
+
+def _extract_md_images(text: str) -> list[dict[str, str]]:
+    """Extract ``![alt](url)`` references from markdown text."""
+    return [
+        {"alt": m.group(1), "url": m.group(2)}
+        for m in _MD_IMAGE_RE.finditer(text)
+    ]
+
+
+def _restore_md_images(
+    text: str,
+    md_images: list[dict[str, str]],
+    uploader: "OssImageUploader | None",
+    warnings: list[ParseWarning],
+    uploaded_cache: dict[str, str],
+) -> str:
+    """Replace ``<!-- image -->`` placeholders with markdown image syntax.
+
+    Tries OSS upload first; falls back to the original URL.
+    ``uploaded_cache`` maps original URL → OSS URL to avoid re-uploading.
+    """
+    placeholder = "<!-- image -->"
+    if placeholder not in text:
+        return text
+
+    index = 0
+    while placeholder in text and index < len(md_images):
+        info = md_images[index]
+        alt = info["alt"]
+        original_url = info["url"]
+
+        # Try OSS upload.
+        final_url: str | None = None
+        if uploader is not None and original_url in uploaded_cache:
+            final_url = uploaded_cache[original_url]
+        elif uploader is not None:
+            try:
+                image = _download_md_image(original_url)
+                if image is not None:
+                    image_key = uploader.upload_png(
+                        f"md_image_{index}", image
+                    )
+                    final_url = uploader.build_image_url(image_key)
+                    uploaded_cache[original_url] = final_url
+                else:
+                    uploaded_cache[original_url] = ""
+            except Exception:
+                uploaded_cache[original_url] = ""
+
+        if final_url is None:
+            final_url = original_url
+
+        text = text.replace(placeholder, f"![{alt}]({final_url})", 1)
+        index += 1
+
+    return text
+
+
+def _download_md_image(url: str) -> Any | None:
+    """Download an image from a URL.  Returns a PIL Image or ``None``."""
+    try:
+        from io import BytesIO
+
+        from PIL import Image
+    except ImportError:
+        return None
+
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30)
+        resp.raise_for_status()
+        return Image.open(BytesIO(resp.content))
+    except Exception:
+        return None
 
 
 def run_docling_convert(
@@ -273,6 +394,7 @@ def export_parsed_document(
     oss_options: OssUploadOptions | None = None,
     *,
     request_id: str | None = None,
+    md_images: list[dict[str, str]] | None = None,
 ) -> ParsedDocument:
     output_format = options.output_format
     json_document = document.export_to_dict() if output_format == "json" else None
@@ -323,7 +445,7 @@ def export_parsed_document(
     else:
         chunks = None
 
-    # Enrich text + page text + chunk text with OSS image URLs.
+    # Enrich chunk text with OSS image URLs (from Docling pipeline, e.g. PDF).
     if output_format == "chunks" and upload_context is not None:
         if images is None:
             images = []
@@ -343,6 +465,16 @@ def export_parsed_document(
                     document, chunk["text"], upload_context, warnings,
                     image_cache, images=images,
                 )
+
+    # Restore markdown-source image references (md/txt input).
+    # Tries OSS upload first, falls back to original URL.
+    if md_images and chunks:
+        uploader = upload_context.uploader if upload_context is not None else None
+        uploaded_cache: dict[str, str] = {}
+        for chunk in chunks:
+            chunk["text"] = _restore_md_images(
+                chunk["text"], md_images, uploader, warnings, uploaded_cache,
+            )
 
     return ParsedDocument(
         text=text,
