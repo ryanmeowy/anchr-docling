@@ -299,6 +299,27 @@ def resolve_suffix(file_name: str | None, source_url: str) -> str:
     return ".bin"
 
 
+def resolve_file_type(suffix: str) -> str:
+    """Map a file suffix to a human-readable file type string."""
+    image_suffixes = {".png", ".jpg", ".jpeg", ".tiff", ".tif", ".bmp", ".gif", ".webp"}
+    if suffix in image_suffixes:
+        return "image"
+    mapping = {
+        ".pdf": "pdf",
+        ".md": "markdown",
+        ".txt": "text",
+        ".docx": "docx",
+        ".html": "html",
+        ".htm": "html",
+        ".pptx": "pptx",
+        ".xlsx": "xlsx",
+        ".csv": "csv",
+        ".xml": "xml",
+        ".json": "json",
+    }
+    return mapping.get(suffix, "pdf")
+
+
 def resolve_input_format(suffix: str) -> Any:
     """Map a file suffix to a Docling InputFormat."""
     from docling.datamodel.base_models import InputFormat

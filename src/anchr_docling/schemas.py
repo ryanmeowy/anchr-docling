@@ -45,7 +45,6 @@ class ParseRequest(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     source_url: HttpUrl = Field(alias="sourceUrl")
     file_name: str | None = Field(default=None, alias="fileName")
-    mime_type: str | None = Field(default=None, alias="mimeType")
     options: ParseOptions = Field(default_factory=ParseOptions)
     oss: OssUploadOptions | None = None
 
@@ -71,6 +70,7 @@ class ParseResponse(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     parser: str
     format: str
+    file_type: str = Field(alias="fileType")
     text: str
     pages: list[ParsedPage] = Field(default_factory=list)
     document: dict[str, Any] | None = None

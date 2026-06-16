@@ -44,6 +44,7 @@ from anchr_docling.setup import (
     load_ocr_option_classes,
     looks_garbled,
     preload_docling_models,
+    resolve_file_type,
     resolve_input_format,
     resolve_suffix,
 )
@@ -77,6 +78,7 @@ class DoclingParser:
 
     def parse(self, request: ParseRequest) -> ParseResponse:
         suffix = resolve_suffix(request.file_name, str(request.source_url))
+        file_type = resolve_file_type(suffix)
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
@@ -87,6 +89,7 @@ class DoclingParser:
             requestId=request.request_id,
             parser="docling",
             format=request.options.output_format,
+            fileType=file_type,
             text=parsed.text,
             pages=parsed.pages,
             document=parsed.document,
