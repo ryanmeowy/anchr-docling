@@ -68,11 +68,11 @@ def prefetch_docling_model_artifacts(default_options: ParseOptions) -> Path:
     engines = set(configured_ocr_engines()) if settings.preload_ocr_models else set()
     return download_models(
         output_dir=docling_settings.artifacts_path,
-        progress=False,
+        progress=True,
         with_layout=True,
         with_tableformer=default_options.table_structure,
         with_tableformer_v2=False,
-        with_code_formula=False,
+        with_code_formula=True,
         with_picture_classifier=False,
         with_smolvlm=False,
         with_granitedocling=False,
@@ -133,7 +133,7 @@ def get_document_converter(
     input_format: Any | None = None,
 ) -> Any:
     fmt = input_format if input_format is not None else components["InputFormat"].PDF
-    cache_key = (ocr, ocr_engine if ocr else None, options.table_structure, fmt)
+    cache_key = (ocr, ocr_engine if ocr else None, options.table_structure, options.formula_enrichment, fmt)
     with _converter_lock:
         converter = _converters.get(cache_key)
         if converter is None:
@@ -180,24 +180,26 @@ def build_document_converter(
     pipeline_options.do_picture_classification = False
     pipeline_options.do_picture_description = False
     pipeline_options.do_code_enrichment = False
-    pipeline_options.do_formula_enrichment = False
+    pipeline_options.do_formula_enrichment = options.formula_enrichment
     pipeline_options.generate_page_images = True
     pipeline_options.generate_picture_images = False
     pipeline_options.generate_table_images = False
 
     # Only PDF / IMAGE need PdfPipelineOptions.  MD, DOCX, HTML etc.
     # work natively without pipeline configuration.
+    # Both formats share the same pipeline options — configure them together
+    # so options like do_formula_enrichment apply regardless of input type.
     pdf_formats = {components["InputFormat"].PDF, components["InputFormat"].IMAGE}
 
-    return components["DocumentConverter"](
-        format_options={
-            fmt: components["PdfFormatOption"](
-                pipeline_options=pipeline_options
-            ),
+    if fmt in pdf_formats:
+        format_opts = {
+            f: components["PdfFormatOption"](pipeline_options=pipeline_options)
+            for f in pdf_formats
         }
-        if fmt in pdf_formats
-        else {}
-    )
+    else:
+        format_opts = {}
+
+    return components["DocumentConverter"](format_options=format_opts)
 
 
 def configured_ocr_engines() -> list[str]:

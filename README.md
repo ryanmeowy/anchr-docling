@@ -14,7 +14,10 @@ pip install -e .
 uvicorn anchr_docling.main:app --host 127.0.0.1 --port 8091
 ```
 
-Apple Silicon 上服务默认用 CPU 运行 Docling，因为 PyTorch MPS 在某些 PDF 转换路径上会因不支持的 `float64` 张量而失败。可覆盖：
+Apple Silicon 上服务默认用 `cpu` 运行 Docling。也可设为 `mps` 利用 GPU 加速，但需注意：
+
+- PyTorch MPS 在某些 PDF 转换路径上会因不支持的 `float64` 张量而失败
+- **公式识别模型（`formulaEnrichment`）不支持 MPS**，开启公式识别时必须使用 `cpu` 或 `cuda`
 
 ```bash
 export ANCHR_DOCLING_DEVICE=cpu
@@ -76,6 +79,7 @@ Content-Type: application/json
 | `validateTextQuality` | bool | 否 | `true` | 是否校验文本质量（拒绝乱码） |
 | `chunkMinTokens` | int | 否 | `400` | chunks 最小 token 数。自定义 chunker 中作为段落合并的下限阈值；native chunker 中控制合并行为 |
 | `chunkMaxTokens` | int | 否 | `800` | chunks 最大 token 数。自定义 chunker 按 `token × 2 ≈ chars` 换算；native chunker 直接按 token 切分 |
+| `formulaEnrichment` | bool | 否 | `false` | 启用 VLM 公式识别模型，将数学公式转为 LaTeX。需下载额外模型（~500MB）。**MPS 设备不支持此模型，需设 `ANCHR_DOCLING_DEVICE=cpu`** |
 | `useNativeChunker` | bool | 否 | `false` | `true` 使用 Docling 原生 HybridChunker（支持 bbox + headings）；`false` 使用自定义 markdown chunker |
 
 ##### oss
@@ -215,6 +219,49 @@ curl -X POST http://127.0.0.1:8091/v1/parse \
 | `headings` | native chunker | 当前 chunk 所在章节的标题层级 |
 
 
+## 公式识别
+
+设置 `"formulaEnrichment": true` 启用 VLM 公式识别模型，可自动检测文档中的数学公式并转为 LaTeX：
+
+```json
+{
+  "options": {
+    "outputFormat": "chunks",
+    "ocr": true,
+    "formulaEnrichment": true
+  }
+}
+```
+
+开启后，`$$...$$` 块中的内容为模型识别出的 LaTeX 公式（如 `$$x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}$$`），可直接被 KaTeX / MathJax 渲染。
+
+### 限制
+
+| 项目 | 说明 |
+|------|------|
+| 设备要求 | 公式 VLM 模型（`codeformulav2`）**不支持 MPS**。Apple Silicon 上需设 `ANCHR_DOCLING_DEVICE=cpu`，否则报错 `MPS is not supported by this model` |
+| 模型大小 | 首次启动需下载约 500MB 的 VLM 模型文件 |
+| 处理速度 | 公式识别增加额外推理步骤，处理时间会有明显增加 |
+| 输出清洗 | 无论是否开启公式识别，输出中的 `<!-- formula-not-decoded -->`、`ParseError: KaTeX parse error:` 等 OCR 残留文本会自动清洗 |
+
+### 混合文字+公式场景
+
+当前 Docling 的 Layout 分析模型在**中文文字与数学公式混排**的图片上分割准确度有限，容易将文字区域误判为公式（或反之），导致识别错误率极高。**纯公式图片**的识别效果尚可。
+
+对于混合场景，更推荐使用 [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) 或者 [MinerU](https://github.com/opendatalab/MinerU)，两者对中英文混排 + 公式的识别效果更好：
+
+- **PaddleOCR**：中文 OCR 准确率高，支持公式区域检测
+- **MinerU**：专为 PDF/图片转 Markdown 设计，内置公式识别管线，对混合排版支持更好
+
+建议策略：
+
+| 场景 | 推荐工具 |
+|------|---------|
+| 纯公式图片 | 本服务 `formulaEnrichment: true` |
+| 混合文字+公式 | PaddleOCR + MinerU |
+| 纯文档（无公式） | 本服务（默认配置） |
+
+
 ## OSS 图片导出
 
 提供 OSS 凭证后，服务会从 PDF 中提取图片，以 PNG 格式上传至阿里云 OSS，并在输出中用 URL 引用。支持 `markdown`、`blocks`、`chunks` 三种输出格式。
@@ -294,6 +341,7 @@ export ANCHR_DOCLING_OSS_ENCRYPT_KEY="<32 字节密钥，原文或 base64>"
 - 调用方负责获取 STS 临时凭证，并用共享 AES 密钥加密后传入。
 - 本服务仅下载源文件 URL、运行 Docling、返回解析结果及可选的 OSS 图片上传。
 - OCR 默认关闭。仅对扫描件或纯图片文档启用 `"ocr": true`。
+- 公式识别默认关闭。对数学/理工类文档建议开启 `"formulaEnrichment": true`，注意需 `ANCHR_DOCLING_DEVICE=cpu`。
 - 部分 PDF 含有损坏或自定义字体的文本层，服务默认会拒绝明显乱码的文本。使用 `"ocrFallback": true` 对这些文档重试 OCR。
 - OCR 回退默认使用 RapidOCR 并强制全页 OCR。可通过以下环境变量切换引擎：
 
