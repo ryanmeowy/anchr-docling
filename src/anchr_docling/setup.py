@@ -28,6 +28,9 @@ def build_ocr_options(
     options.force_full_page_ocr = settings.force_full_page_ocr
     if hasattr(options, "use_gpu"):
         options.use_gpu = settings.device.strip().lower() not in {"cpu", ""}
+    # RapidOCR uses Paddle backend for better Chinese recognition
+    if engine == "rapidocr" and hasattr(options, "backend"):
+        options.backend = "paddle"
     return options
 
 
