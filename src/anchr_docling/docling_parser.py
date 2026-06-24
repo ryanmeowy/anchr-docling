@@ -7,6 +7,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from anchr_docling.config import settings
+from anchr_docling._sanitize import sanitize_markdown_text
 from anchr_docling.blocks import export_blocks
 from anchr_docling.chunking import (
     export_markdown_chunks,
@@ -44,6 +45,7 @@ from anchr_docling.setup import (
     load_ocr_option_classes,
     looks_garbled,
     preload_docling_models,
+    resolve_file_type,
     resolve_input_format,
     resolve_suffix,
 )
@@ -77,6 +79,7 @@ class DoclingParser:
 
     def parse(self, request: ParseRequest) -> ParseResponse:
         suffix = resolve_suffix(request.file_name, str(request.source_url))
+        file_type = resolve_file_type(suffix)
         with tempfile.TemporaryDirectory(prefix="anchr-docling-") as tmp_dir:
             source_path = Path(tmp_dir) / f"source{suffix}"
             download_source(str(request.source_url), source_path)
@@ -87,6 +90,7 @@ class DoclingParser:
             requestId=request.request_id,
             parser="docling",
             format=request.options.output_format,
+            fileType=file_type,
             text=parsed.text,
             pages=parsed.pages,
             document=parsed.document,
@@ -475,6 +479,15 @@ def export_parsed_document(
             chunk["text"] = _restore_md_images(
                 chunk["text"], md_images, uploader, warnings, uploaded_cache,
             )
+
+    # Sanitize formula-related OCR artifacts from text/markdown/chunks output.
+    if output_format in {"markdown", "chunks", "text"}:
+        text = sanitize_markdown_text(text)
+        for page in pages:
+            page.text = sanitize_markdown_text(page.text)
+        if chunks:
+            for chunk in chunks:
+                chunk["text"] = sanitize_markdown_text(chunk["text"])
 
     return ParsedDocument(
         text=text,

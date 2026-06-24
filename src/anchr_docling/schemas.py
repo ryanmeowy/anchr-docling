@@ -11,6 +11,7 @@ class ParseOptions(BaseModel):
     ocr: bool = False
     ocr_fallback: bool = Field(default=False, alias="ocrFallback")
     table_structure: bool = True
+    formula_enrichment: bool = Field(default=False, alias="formulaEnrichment")
     validate_text_quality: bool = Field(default=True, alias="validateTextQuality")
     chunk_min_tokens: int = Field(default=400, alias="chunkMinTokens")
     chunk_max_tokens: int = Field(default=800, alias="chunkMaxTokens")
@@ -45,7 +46,6 @@ class ParseRequest(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     source_url: HttpUrl = Field(alias="sourceUrl")
     file_name: str | None = Field(default=None, alias="fileName")
-    mime_type: str | None = Field(default=None, alias="mimeType")
     options: ParseOptions = Field(default_factory=ParseOptions)
     oss: OssUploadOptions | None = None
 
@@ -71,6 +71,7 @@ class ParseResponse(BaseModel):
     request_id: str | None = Field(default=None, alias="requestId")
     parser: str
     format: str
+    file_type: str = Field(alias="fileType")
     text: str
     pages: list[ParsedPage] = Field(default_factory=list)
     document: dict[str, Any] | None = None
