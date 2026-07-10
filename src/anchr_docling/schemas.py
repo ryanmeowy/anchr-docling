@@ -1,7 +1,8 @@
+from datetime import datetime
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
-
 
 OutputFormat = Literal["markdown", "html", "text", "json", "blocks", "chunks"]
 
@@ -43,7 +44,7 @@ class OssUploadOptions(BaseModel):
 
 
 class ParseRequest(BaseModel):
-    request_id: str | None = Field(default=None, alias="requestId")
+    request_id: str = Field(alias="requestId", min_length=1, max_length=200)
     source_url: HttpUrl = Field(alias="sourceUrl")
     file_name: str | None = Field(default=None, alias="fileName")
     options: ParseOptions = Field(default_factory=ParseOptions)
@@ -68,7 +69,7 @@ class ParseWarning(BaseModel):
 
 
 class ParseResponse(BaseModel):
-    request_id: str | None = Field(default=None, alias="requestId")
+    request_id: str = Field(alias="requestId")
     parser: str
     format: str
     file_type: str = Field(alias="fileType")
@@ -79,5 +80,30 @@ class ParseResponse(BaseModel):
     chunks: list[dict[str, Any]] | None = None
     images: list[dict[str, Any]] | None = None
     warnings: list[ParseWarning] | None = None
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class JobStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class JobError(BaseModel):
+    code: str
+    message: str
+
+
+class JobResponse(BaseModel):
+    job_id: str = Field(alias="jobId")
+    request_id: str = Field(alias="requestId")
+    status: JobStatus
+    created_at: datetime = Field(alias="createdAt")
+    started_at: datetime | None = Field(default=None, alias="startedAt")
+    finished_at: datetime | None = Field(default=None, alias="finishedAt")
+    result: ParseResponse | None = None
+    error: JobError | None = None
 
     model_config = ConfigDict(populate_by_name=True)

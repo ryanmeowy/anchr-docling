@@ -2,26 +2,19 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 import httpx
 
-from anchr_docling.config import settings
 from anchr_docling._sanitize import sanitize_markdown_text
 from anchr_docling.blocks import export_blocks
 from anchr_docling.chunking import (
     export_markdown_chunks,
     export_native_chunks,
 )
-from anchr_docling.errors import (
-    DoclingParseError,
-    ImageUploadError,
-    SourceDownloadError,
-    add_warning,
-)
+from anchr_docling.config import settings
+from anchr_docling.errors import DoclingParseError, SourceDownloadError
 from anchr_docling.images import (
-    ImageUploadContext,
-    OssCredentials,
+    OssImageUploader,
     _validate_image_size,
     build_image_upload_context,
     enrich_markdown_text,
@@ -35,14 +28,13 @@ from anchr_docling.schemas import (
     ParseResponse,
     ParseWarning,
 )
+from anchr_docling.security import download_validated_bytes, open_validated_response
 from anchr_docling.setup import (
-    build_document_converter,
-    configured_ocr_engines,
     configure_torch_device,
+    configured_ocr_engines,
     first_configured_ocr_engine,
     get_document_converter,
     load_docling_components,
-    load_ocr_option_classes,
     looks_garbled,
     preload_docling_models,
     resolve_file_type,
@@ -116,26 +108,22 @@ def download_source(source_url: str, target_path: Path) -> None:
 
     total = 0
     try:
-        with httpx.stream(
-            "GET",
-            source_url,
-            headers=headers,
-            follow_redirects=True,
-            timeout=timeout,
-        ) as response:
-            response.raise_for_status()
-            with target_path.open("wb") as output:
-                for chunk in response.iter_bytes():
-                    total += len(chunk)
-                    if total > max_bytes:
-                        raise SourceDownloadError(
-                            f"source file exceeds {settings.max_download_mb} MB limit"
-                        )
-                    output.write(chunk)
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            response = open_validated_response(client, source_url, settings, headers=headers)
+            try:
+                response.raise_for_status()
+                with target_path.open("wb") as output:
+                    for chunk in response.iter_bytes():
+                        total += len(chunk)
+                        if total > max_bytes:
+                            raise SourceDownloadError(
+                                f"source file exceeds {settings.max_download_mb} MB limit"
+                            )
+                        output.write(chunk)
+            finally:
+                response.close()
     except httpx.HTTPStatusError as exc:
-        raise SourceDownloadError(
-            f"source URL responded HTTP {exc.response.status_code}"
-        ) from exc
+        raise SourceDownloadError(f"source URL responded HTTP {exc.response.status_code}") from exc
     except httpx.HTTPError as exc:
         raise SourceDownloadError(f"failed to download source URL: {exc}") from exc
 
@@ -167,8 +155,7 @@ def convert_document(
         if options.output_format != "chunks":
             suffix = source_path.suffix.lower()
             raise DoclingParseError(
-                f"outputFormat must be 'chunks' for {suffix} input, "
-                f"got '{options.output_format}'"
+                f"outputFormat must be 'chunks' for {suffix} input, got '{options.output_format}'"
             )
 
         text_content = source_path.read_text(encoding="utf-8")
@@ -186,7 +173,11 @@ def convert_document(
             # Use Docling's MD converter for proper structure (headings, etc.).
             components = load_docling_components()
             converter = get_document_converter(
-                options, components, {}, ocr=False, ocr_engine=None,
+                options,
+                components,
+                {},
+                ocr=False,
+                ocr_engine=None,
                 input_format=resolve_input_format(".md"),
             )
             result = converter.convert(source_path)
@@ -199,7 +190,10 @@ def convert_document(
                     doc.add_text(text=stripped, label=DocItemLabel.TEXT)
 
         return export_parsed_document(
-            doc, options, oss_options, request_id=request_id,
+            doc,
+            options,
+            oss_options,
+            request_id=request_id,
             md_images=md_images,
         )
 
@@ -256,10 +250,7 @@ _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 
 def _extract_md_images(text: str) -> list[dict[str, str]]:
     """Extract ``![alt](url)`` references from markdown text."""
-    return [
-        {"alt": m.group(1), "url": m.group(2)}
-        for m in _MD_IMAGE_RE.finditer(text)
-    ]
+    return [{"alt": m.group(1), "url": m.group(2)} for m in _MD_IMAGE_RE.finditer(text)]
 
 
 def _restore_md_images(
@@ -292,9 +283,7 @@ def _restore_md_images(
             try:
                 image = _download_md_image(original_url)
                 if image is not None:
-                    image_key = uploader.upload_png(
-                        f"md_image_{index}", image
-                    )
+                    image_key = uploader.upload_png(f"md_image_{index}", image)
                     final_url = uploader.build_image_url(image_key)
                     uploaded_cache[original_url] = final_url
                 else:
@@ -321,9 +310,13 @@ def _download_md_image(url: str) -> Any | None:
         return None
 
     try:
-        resp = httpx.get(url, follow_redirects=True, timeout=30)
-        resp.raise_for_status()
-        return Image.open(BytesIO(resp.content))
+        content = download_validated_bytes(
+            url,
+            settings,
+            timeout_seconds=30,
+            max_bytes=settings.max_download_mb * 1024 * 1024,
+        )
+        return Image.open(BytesIO(content))
     except Exception:
         return None
 
@@ -409,9 +402,7 @@ def export_parsed_document(
         else None
     )
     blocks = (
-        export_blocks(document, upload_context, warnings)
-        if output_format == "blocks"
-        else None
+        export_blocks(document, upload_context, warnings) if output_format == "blocks" else None
     )
     pages = [
         ParsedPage(
@@ -432,13 +423,23 @@ def export_parsed_document(
         images = []
         image_cache: dict[str, str | None] = {}
         text = enrich_markdown_text(
-            document, text, upload_context, warnings, image_cache, images=images,
+            document,
+            text,
+            upload_context,
+            warnings,
+            image_cache,
+            images=images,
         )
         for page in pages:
             if page.page_no is not None:
                 page.text = enrich_markdown_text(
-                    document, page.text, upload_context, warnings,
-                    image_cache, page_no=page.page_no, images=images,
+                    document,
+                    page.text,
+                    upload_context,
+                    warnings,
+                    image_cache,
+                    page_no=page.page_no,
+                    images=images,
                 )
 
     if output_format == "chunks":
@@ -455,19 +456,33 @@ def export_parsed_document(
             images = []
         image_cache: dict[str, str | None] = {}
         text = enrich_markdown_text(
-            document, text, upload_context, warnings, image_cache, images=images,
+            document,
+            text,
+            upload_context,
+            warnings,
+            image_cache,
+            images=images,
         )
         for page in pages:
             if page.page_no is not None:
                 page.text = enrich_markdown_text(
-                    document, page.text, upload_context, warnings,
-                    image_cache, page_no=page.page_no, images=images,
+                    document,
+                    page.text,
+                    upload_context,
+                    warnings,
+                    image_cache,
+                    page_no=page.page_no,
+                    images=images,
                 )
         if chunks:
             for chunk in chunks:
                 chunk["text"] = enrich_markdown_text(
-                    document, chunk["text"], upload_context, warnings,
-                    image_cache, images=images,
+                    document,
+                    chunk["text"],
+                    upload_context,
+                    warnings,
+                    image_cache,
+                    images=images,
                 )
 
     # Restore markdown-source image references (md/txt input).
@@ -477,7 +492,11 @@ def export_parsed_document(
         uploaded_cache: dict[str, str] = {}
         for chunk in chunks:
             chunk["text"] = _restore_md_images(
-                chunk["text"], md_images, uploader, warnings, uploaded_cache,
+                chunk["text"],
+                md_images,
+                uploader,
+                warnings,
+                uploaded_cache,
             )
 
     # Sanitize formula-related OCR artifacts from text/markdown/chunks output.

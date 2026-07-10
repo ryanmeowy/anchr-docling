@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -13,8 +14,13 @@ from anchr_docling._utils import (
     resolve_page_no,
 )
 from anchr_docling.config import settings
-from anchr_docling.errors import ImageUploadError, add_warning, sanitize_error_message
-from anchr_docling.schemas import EncryptedCredentials, OssUploadOptions, ParseWarning, ParseOptions
+from anchr_docling.errors import (
+    ImageUploadError,
+    SourceDownloadError,
+    add_warning,
+    sanitize_error_message,
+)
+from anchr_docling.schemas import EncryptedCredentials, OssUploadOptions, ParseWarning
 
 _log = logging.getLogger(__name__)
 
@@ -246,7 +252,7 @@ def enrich_markdown_text(
 
     # Replace placeholders one at a time, in order.
     result = markdown_text
-    for url, alt in zip(image_urls, alt_texts):
+    for url, alt in zip(image_urls, alt_texts, strict=False):
         if url is not None:
             result = result.replace(
                 placeholder, f"![{alt}]({url})", 1
@@ -314,8 +320,8 @@ def encode_png(image: Any) -> bytes:
 
 def decrypt_oss_credentials(encrypted: EncryptedCredentials) -> OssCredentials:
     try:
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         from cryptography.hazmat.primitives import padding
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     except ImportError as exc:
         raise ImageUploadError("cryptography is not installed") from exc
 
@@ -405,4 +411,3 @@ def _validate_image_size(source_path: Path) -> None:
                 f"limit of {settings.max_image_megapixels} megapixels "
                 f"({limit:,} pixels)"
             )
-
