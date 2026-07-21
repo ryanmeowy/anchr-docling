@@ -11,8 +11,12 @@ cd ~/code/anchr-docling
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-uvicorn anchr_docling.main:app --host 127.0.0.1 --port 8091
+export ANCHR_DOCLING_API_TOKEN="$(openssl rand -hex 32)"
+export ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS="anchr.oss-cn-shanghai.aliyuncs.com"
+uvicorn anchr_docling.main:app --host <YOUR MACHINE IP> --port 8091
 ```
+
+服务启动时会强制校验内部 Token（至少 32 个字符）和下载域名白名单。Token 必须同时配置到 `anchr-app` 的 `APP_DOCLING_API_TOKEN`。
 
 Apple Silicon 上服务默认用 `cpu` 运行 Docling。也可设为 `mps` 利用 GPU 加速，但需注意：
 
@@ -45,28 +49,33 @@ export ANCHR_DOCLING_PRELOAD_OCR_MODELS=true
 ### 健康检查
 
 ```bash
-curl http://127.0.0.1:8091/healthz
+curl http://<YOUR MACHINE IP>:8091/healthz
 ```
 
-### 解析文档
+健康检查不需要鉴权，并返回当前运行数、排队数和队列容量。
+
+### 提交解析任务
 
 ```bash
-POST /v1/parse
+POST /v1/jobs
+Authorization: Bearer <internal-token>
 Content-Type: application/json
 ```
+
+任务 API 是异步的。默认只有一个解析 worker，最多等待 8 个任务；队列满时返回 `429` 和 `Retry-After`。`requestId` 必填并作为幂等键：相同请求重复提交返回已有任务，不同请求复用同一 ID 返回 `409`。
 
 #### 请求参数
 
 ##### 顶层
 
-| 字段 | 类型 | 必填 | 默认 | 说明 |
-|------|------|------|------|------|
-| `requestId` | string | 否 | — | 请求标识，用作图片 OSS key 的后缀。为空时用毫秒时间戳 |
-| `sourceUrl` | string | **是** | — | 源文件下载地址，支持 PDF / 图片 |
+| 字段 | 类型 | 必填 | 默认 | 说明                            |
+|------|------|------|------|-------------------------------|
+| `requestId` | string | **是** | — | 请求幂等标识，同时用作图片 OSS key 的后缀     |
+| `sourceUrl` | string | **是** | — | 源文件下载地址，支持 PDF / 图片           |
 | `fileName` | string | 否 | — | 文件名（含后缀），用于推断文件类型。未传则从 URL 路径提取 |
-| `mimeType` | string | 否 | — | 保留字段，暂未使用 |
-| `options` | object | 否 | — | 解析选项 |
-| `oss` | object | 否 | — | OSS 图片上传配置，不传则不导出图片 |
+| `mimeType` | string | 否 | — | 保留字段，暂未使用, 后续可能用于类型校验         |
+| `options` | object | 否 | — | 解析选项                          |
+| `oss` | object | 否 | — | OSS 图片上传配置，不传则不导出图片           |
 
 ##### options
 
@@ -101,7 +110,8 @@ Content-Type: application/json
 #### 示例请求
 
 ```bash
-curl -X POST http://127.0.0.1:8091/v1/parse \
+curl -X POST http://<Mac的Tailscale-IP>:8091/v1/jobs \
+  -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
     "requestId": "task_1:item_1",
@@ -113,6 +123,33 @@ curl -X POST http://127.0.0.1:8091/v1/parse \
     }
   }'
 ```
+
+新任务返回 `202 Accepted`：
+
+```json
+{
+  "jobId": "4c54b626-e367-4c92-a351-62d52f68948a",
+  "requestId": "task_1:item_1",
+  "status": "queued",
+  "createdAt": "2026-07-10T10:00:00Z"
+}
+```
+
+轮询任务：
+
+```bash
+curl http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
+  -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN"
+```
+
+状态依次为 `queued`、`running`、`succeeded` 或 `failed`。成功时 `result` 字段包含下述解析响应；Spring 读取成功结果后会确认并释放内存：
+
+```bash
+curl -X DELETE http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
+  -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN"
+```
+
+运行或排队中的任务不能删除。未确认结果会在 10 分钟后清理，**服务重启后内存任务会丢失**，由 Spring 使用相同 `requestId` 重新提交。
 
 #### 响应
 
@@ -143,6 +180,14 @@ curl -X POST http://127.0.0.1:8091/v1/parse \
 | `warnings` | array\|null | 警告列表 |
 
 `outputFormat` 支持 `markdown`、`html`、`text`、`json`、`blocks`、`chunks`。
+
+## 安全与资源控制
+
+- `/v1/*` 必须携带 Bearer Token；`/healthz` 是唯一无需鉴权的接口。
+- Swagger、ReDoc 和 OpenAPI 默认关闭；本地调试可设置 `ANCHR_DOCLING_ENABLE_DOCS=true`。
+- `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS` 是逗号分隔的精确主机名白名单，只允许 HTTPS 默认端口。原始文件和 Markdown 内嵌图片的每次重定向都会重新校验。
+- `ANCHR_DOCLING_MAX_DOWNLOAD_MB` 和 `ANCHR_DOCLING_MAX_IMAGE_MEGAPIXELS` 继续限制下载体积和图片解码尺寸。
+- 队列限制并发和等待数量，但不能强制终止正在解析的单个恶意文件；单文件硬超时和独立进程隔离不在当前版本范围内。
 
 ### markdown / html / text
 
