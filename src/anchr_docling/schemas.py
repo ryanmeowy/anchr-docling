@@ -17,6 +17,7 @@ class ParseOptions(BaseModel):
     chunk_min_tokens: int = Field(default=400, alias="chunkMinTokens")
     chunk_max_tokens: int = Field(default=800, alias="chunkMaxTokens")
     use_native_chunker: bool = Field(default=False, alias="useNativeChunker")
+    include_embedded_images: bool = Field(default=False, alias="includeEmbeddedImages")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -31,7 +32,6 @@ class ParseOptions(BaseModel):
 class EncryptedCredentials(BaseModel):
     iv: str
     ciphertext: str
-    tag: str | None = None
 
 
 class OssUploadOptions(BaseModel):

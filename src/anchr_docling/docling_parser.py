@@ -398,7 +398,8 @@ def export_parsed_document(
     warnings: list[ParseWarning] = []
     upload_context = (
         build_image_upload_context(oss_options, warnings, request_id=request_id)
-        if output_format in {"blocks", "markdown", "chunks"}
+        if options.include_embedded_images
+        and output_format in {"blocks", "markdown", "chunks"}
         else None
     )
     blocks = (

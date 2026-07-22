@@ -97,15 +97,19 @@ def attach_picture_image_metadata(
     block["imageMimeType"] = "image/png"
     block["imageWidth"], block["imageHeight"] = image.size
 
-    if upload_context is None or upload_context.uploader is None:
+    if upload_context is None:
+        block["imageUploadStatus"] = "disabled"
+        return
+
+    if upload_context.uploader is None:
         code = (
             upload_context.unavailable_code
-            if upload_context is not None and upload_context.unavailable_code is not None
+            if upload_context.unavailable_code is not None
             else "image_upload_skipped_no_credentials"
         )
         message = (
             upload_context.unavailable_message
-            if upload_context is not None and upload_context.unavailable_message is not None
+            if upload_context.unavailable_message is not None
             else "OSS credentials were not provided; image upload was skipped."
         )
         block["imageUploadStatus"] = (

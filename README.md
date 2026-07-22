@@ -75,7 +75,7 @@ Content-Type: application/json
 | `fileName` | string | 否 | — | 文件名（含后缀），用于推断文件类型。未传则从 URL 路径提取 |
 | `mimeType` | string | 否 | — | 保留字段，暂未使用, 后续可能用于类型校验         |
 | `options` | object | 否 | — | 解析选项                          |
-| `oss` | object | 否 | — | OSS 图片上传配置，不传则不导出图片           |
+| `oss` | object | 否 | — | 仅在 `includeEmbeddedImages=true` 时读取的 OSS 图片上传配置 |
 
 ##### options
 
@@ -90,6 +90,7 @@ Content-Type: application/json
 | `chunkMaxTokens` | int | 否 | `800` | chunks 最大 token 数。自定义 chunker 按 `token × 2 ≈ chars` 换算；native chunker 直接按 token 切分 |
 | `formulaEnrichment` | bool | 否 | `false` | 启用 VLM 公式识别模型，将数学公式转为 LaTeX。需下载额外模型（~500MB）。**MPS 设备不支持此模型，需设 `ANCHR_DOCLING_DEVICE=cpu`** |
 | `useNativeChunker` | bool | 否 | `false` | `true` 使用 Docling 原生 HybridChunker（支持 bbox + headings）；`false` 使用自定义 markdown chunker |
+| `includeEmbeddedImages` | bool | 否 | `false` | 是否启用文档内嵌图片上传。默认关闭；关闭时忽略 `oss`，不解密凭据、不上传图片、不产生缺少凭据告警 |
 
 ##### oss
 
@@ -309,13 +310,18 @@ curl -X DELETE http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
 
 ## OSS 图片导出
 
-提供 OSS 凭证后，服务会从 PDF 中提取图片，以 PNG 格式上传至阿里云 OSS，并在输出中用 URL 引用。支持 `markdown`、`blocks`、`chunks` 三种输出格式。
+文档内嵌图片上传默认关闭。调用方必须同时显式设置 `includeEmbeddedImages=true` 并提供 OSS 凭证，服务才会尝试从 PDF 中提取图片并上传。支持 `markdown`、`blocks`、`chunks` 三种输出格式。
+
+> 当前 AES-CBC 凭据协议仅为遗留兼容，不应在生产环境启用。Anchr app 默认发送 `includeEmbeddedImages=false` 且不发送 STS；待版本化 AEAD 协议、图片消费者和对象生命周期完整实现后再重新开放。
 
 ### 请求
 
 ```json
 {
-  "options": { "outputFormat": "markdown" },
+  "options": {
+    "outputFormat": "markdown",
+    "includeEmbeddedImages": true
+  },
   "oss": {
     "endpoint": "oss-cn-hangzhou.aliyuncs.com",
     "bucket": "my-bucket",
