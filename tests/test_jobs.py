@@ -13,7 +13,13 @@ from anchr_docling.jobs import (
     QueueFullError,
     RequestConflictError,
 )
-from anchr_docling.schemas import JobStatus, ParseRequest, ParseResponse
+from anchr_docling.schemas import (
+    EncryptedCredentials,
+    JobStatus,
+    OssUploadOptions,
+    ParseRequest,
+    ParseResponse,
+)
 
 TOKEN = "t" * 64
 
@@ -31,10 +37,19 @@ def make_settings(**overrides: object) -> Settings:
     return Settings(_env_file=None, **values)
 
 
-def make_request(request_id: str, file_name: str = "sample.pdf") -> ParseRequest:
+def make_request(
+    request_id: str,
+    file_name: str = "sample.pdf",
+    *,
+    contract_version: int | None = None,
+    source_revision: str | None = None,
+    source_url: str = "https://anchr.oss-cn-shanghai.aliyuncs.com/anchr-dev/sample.pdf",
+) -> ParseRequest:
     return ParseRequest(
         requestId=request_id,
-        sourceUrl="https://anchr.oss-cn-shanghai.aliyuncs.com/anchr-dev/sample.pdf",
+        contractVersion=contract_version,
+        sourceRevision=source_revision,
+        sourceUrl=source_url,
         fileName=file_name,
     )
 
@@ -120,6 +135,98 @@ class JobManagerTest(unittest.IsolatedAsyncioTestCase):
             failed = manager.get(record.job_id)
             self.assertEqual("DOCLING_PARSE_ERROR", failed.error.code)
             self.assertEqual("bad document", failed.error.message)
+        finally:
+            await manager.stop()
+
+    async def test_v2_ignores_transient_source_url_but_fences_source_revision(self) -> None:
+        manager = JobManager(ImmediateParser(), make_settings())
+        await manager.start()
+        try:
+            first = make_request(
+                "task-1:item-1:1",
+                contract_version=2,
+                source_revision="v1:" + "a" * 64,
+                source_url="https://anchr.oss-cn-shanghai.aliyuncs.com/file.pdf?Expires=1&Signature=old",
+            )
+            record, created = manager.submit(first)
+            self.assertTrue(created)
+
+            refreshed_url = first.model_copy(
+                update={
+                    "source_url": "https://anchr.oss-cn-shanghai.aliyuncs.com/file.pdf?Expires=2&Signature=new"
+                }
+            )
+            duplicate, duplicate_created = manager.submit(refreshed_url)
+            self.assertFalse(duplicate_created)
+            self.assertEqual(record.job_id, duplicate.job_id)
+
+            changed_revision = first.model_copy(
+                update={"source_revision": "v1:" + "b" * 64}
+            )
+            with self.assertRaises(RequestConflictError):
+                manager.submit(changed_revision)
+        finally:
+            await manager.stop()
+
+    async def test_legacy_fingerprint_still_includes_source_url(self) -> None:
+        manager = JobManager(ImmediateParser(), make_settings())
+        await manager.start()
+        try:
+            first = make_request("legacy-request")
+            manager.submit(first)
+            with self.assertRaises(RequestConflictError):
+                manager.submit(
+                    make_request(
+                        "legacy-request",
+                        source_url="https://anchr.oss-cn-shanghai.aliyuncs.com/other.pdf",
+                    )
+                )
+        finally:
+            await manager.stop()
+
+    async def test_v2_output_fingerprint_excludes_encrypted_credentials(self) -> None:
+        manager = JobManager(ImmediateParser(), make_settings())
+        await manager.start()
+        try:
+            first = make_request(
+                "task-1:item-1:1",
+                contract_version=2,
+                source_revision="v1:" + "a" * 64,
+            ).model_copy(
+                update={
+                    "oss": OssUploadOptions(
+                        endpoint="oss-cn-shanghai.aliyuncs.com",
+                        bucket="anchr",
+                        basePath="embedded/task-1",
+                        encryptedCredentials=EncryptedCredentials(
+                            iv="old-iv",
+                            ciphertext="old-ciphertext",
+                        ),
+                    )
+                }
+            )
+            record, _ = manager.submit(first)
+            refreshed_credentials = first.model_copy(
+                update={
+                    "oss": first.oss.model_copy(
+                        update={
+                            "encrypted_credentials": EncryptedCredentials(
+                                iv="new-iv",
+                                ciphertext="new-ciphertext",
+                            )
+                        }
+                    )
+                }
+            )
+            duplicate, created = manager.submit(refreshed_credentials)
+            self.assertFalse(created)
+            self.assertEqual(record.job_id, duplicate.job_id)
+
+            changed_output = first.model_copy(
+                update={"oss": first.oss.model_copy(update={"base_path": "embedded/other"})}
+            )
+            with self.assertRaises(RequestConflictError):
+                manager.submit(changed_output)
         finally:
             await manager.stop()
 

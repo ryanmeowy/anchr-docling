@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -95,9 +96,7 @@ class JobManager:
         self._cleanup_task = None
 
     def submit(self, request: ParseRequest) -> tuple[JobRecord, bool]:
-        fingerprint = hashlib.sha256(
-            request.model_dump_json(by_alias=True, exclude_none=False).encode("utf-8")
-        ).hexdigest()
+        fingerprint = self._fingerprint(request)
         existing_id = self._request_jobs.get(request.request_id)
         if existing_id is not None:
             existing = self._jobs.get(existing_id)
@@ -134,11 +133,14 @@ class JobManager:
             raise JobNotFoundError(job_id)
         return record
 
-    def delete(self, job_id: str) -> None:
-        record = self.get(job_id)
+    def delete(self, job_id: str) -> bool:
+        record = self._jobs.get(job_id)
+        if record is None:
+            return False
         if record.status in (JobStatus.QUEUED, JobStatus.RUNNING):
             raise ActiveJobError(job_id)
         self._remove(record)
+        return True
 
     @property
     def queued_count(self) -> int:
@@ -245,6 +247,40 @@ class JobManager:
         self._jobs.pop(record.job_id, None)
         if self._request_jobs.get(record.request.request_id) == record.job_id:
             self._request_jobs.pop(record.request.request_id, None)
+
+    @staticmethod
+    def _fingerprint(request: ParseRequest) -> str:
+        if request.contract_version == 2:
+            stable_output = None
+            if request.oss is not None:
+                stable_output = {
+                    "endpoint": request.oss.endpoint,
+                    "bucket": request.oss.bucket,
+                    "basePath": request.oss.base_path,
+                }
+            payload = {
+                "contractVersion": 2,
+                "requestId": request.request_id,
+                "sourceRevision": request.source_revision,
+                "fileName": request.file_name,
+                "options": request.options.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=False,
+                ),
+                "output": stable_output,
+            }
+            serialized = json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        else:
+            # Keep the original full-payload fingerprint for legacy requests so a rolling
+            # deployment cannot silently reinterpret an already accepted requestId.
+            serialized = request.model_dump_json(by_alias=True, exclude_none=False)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _now() -> datetime:

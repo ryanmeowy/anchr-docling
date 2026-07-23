@@ -62,7 +62,9 @@ Authorization: Bearer <internal-token>
 Content-Type: application/json
 ```
 
-任务 API 是异步的。默认只有一个解析 worker，最多等待 8 个任务；队列满时返回 `429` 和 `Retry-After`。`requestId` 必填并作为幂等键：相同请求重复提交返回已有任务，不同请求复用同一 ID 返回 `409`。
+任务 API 是异步的。默认只有一个解析 worker，最多等待 8 个任务；队列满时返回 `429` 和 `Retry-After`。`requestId` 必填并作为一次业务解析 attempt 的幂等键。对应内存幂等记录存续期间，相同 attempt 重复提交返回已有任务，不同稳定输入复用同一 ID 返回 `409`。
+
+App 新协议使用 `contractVersion=2`。v2 指纹包含 `requestId`、`sourceRevision`、`fileName`、解析选项和稳定输出位置，不包含会刷新的下载签名 URL、STS 密文或过期时间。因此内存幂等记录存续期间，同一次 attempt 可使用新签名 URL 安全重试；源内容变化必须使用新的 `sourceRevision` 和 parse attempt。ACK、TTL 清理或进程重启后，内存幂等记录会消失，跨生命周期的一致性由 App 持久化的 parse identity 与 ANCHR-106 恢复流程保证。未传 `contractVersion` 的旧客户端继续使用完整请求 JSON 指纹。
 
 #### 请求参数
 
@@ -70,9 +72,11 @@ Content-Type: application/json
 
 | 字段 | 类型 | 必填 | 默认 | 说明                            |
 |------|------|------|------|-------------------------------|
-| `requestId` | string | **是** | — | 请求幂等标识，同时用作图片 OSS key 的后缀     |
+| `requestId` | string | **是** | — | 解析 attempt 幂等标识，格式为 `taskId:itemId:parseAttempt` |
+| `contractVersion` | int | 新协议是 | — | v2 客户端固定传 `2`；缺失时按旧指纹协议处理 |
+| `sourceRevision` | string | v2 是 | — | App 生成的稳定源内容 revision；不得使用签名 URL |
 | `sourceUrl` | string | **是** | — | 源文件下载地址，支持 PDF / 图片           |
-| `fileName` | string | 否 | — | 文件名（含后缀），用于推断文件类型。未传则从 URL 路径提取 |
+| `fileName` | string | v2 是 | — | 文件名（含后缀），v2 必须非空；旧协议未传时从 URL 路径提取 |
 | `mimeType` | string | 否 | — | 保留字段，暂未使用, 后续可能用于类型校验         |
 | `options` | object | 否 | — | 解析选项                          |
 | `oss` | object | 否 | — | 仅在 `includeEmbeddedImages=true` 时读取的 OSS 图片上传配置 |
@@ -115,7 +119,9 @@ curl -X POST http://<Mac的Tailscale-IP>:8091/v1/jobs \
   -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "requestId": "task_1:item_1",
+    "requestId": "task_1:item_1:1",
+    "contractVersion": 2,
+    "sourceRevision": "v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     "sourceUrl": "https://example.com/prd.pdf",
     "fileName": "prd.pdf",
     "options": {
@@ -130,7 +136,7 @@ curl -X POST http://<Mac的Tailscale-IP>:8091/v1/jobs \
 ```json
 {
   "jobId": "4c54b626-e367-4c92-a351-62d52f68948a",
-  "requestId": "task_1:item_1",
+  "requestId": "task_1:item_1:1",
   "status": "queued",
   "createdAt": "2026-07-10T10:00:00Z"
 }
@@ -150,13 +156,13 @@ curl -X DELETE http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
   -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN"
 ```
 
-运行或排队中的任务不能删除。未确认结果会在 10 分钟后清理，**服务重启后内存任务会丢失**，由 Spring 使用相同 `requestId` 重新提交。
+运行或排队中的任务不能删除。终态任务的 DELETE 是幂等确认：任务已确认、过期或因重启丢失时仍返回 `204`。未确认结果会在 10 分钟后清理，**服务重启后内存任务会丢失**，由 Spring 使用相同 `requestId`、`sourceRevision` 和稳定请求参数重新提交。
 
 #### 响应
 
 ```json
 {
-  "requestId": "task_1:item_1",
+  "requestId": "task_1:item_1:1",
   "parser": "docling",
   "format": "markdown",
   "text": "# 解析后的文档\n...",

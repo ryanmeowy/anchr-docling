@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 OutputFormat = Literal["markdown", "html", "text", "json", "blocks", "chunks"]
 
@@ -45,12 +45,30 @@ class OssUploadOptions(BaseModel):
 
 class ParseRequest(BaseModel):
     request_id: str = Field(alias="requestId", min_length=1, max_length=200)
+    contract_version: Literal[1, 2] | None = Field(default=None, alias="contractVersion")
+    source_revision: str | None = Field(
+        default=None,
+        alias="sourceRevision",
+        min_length=1,
+        max_length=80,
+    )
     source_url: HttpUrl = Field(alias="sourceUrl")
     file_name: str | None = Field(default=None, alias="fileName")
     options: ParseOptions = Field(default_factory=ParseOptions)
     oss: OssUploadOptions | None = None
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="after")
+    def validate_v2_contract(self) -> "ParseRequest":
+        if self.contract_version != 2:
+            return self
+        if not self.source_revision:
+            raise ValueError("sourceRevision is required for contractVersion 2")
+        if self.file_name is None or not self.file_name.strip():
+            raise ValueError("fileName is required for contractVersion 2")
+        self.file_name = self.file_name.strip()
+        return self
 
 
 class ParsedPage(BaseModel):

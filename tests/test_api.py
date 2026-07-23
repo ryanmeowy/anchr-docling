@@ -60,6 +60,8 @@ class ApiTest(unittest.TestCase):
     def payload(self) -> dict[str, object]:
         return {
             "requestId": "api-request-1",
+            "contractVersion": 2,
+            "sourceRevision": "v1:" + "a" * 64,
             "sourceUrl": "https://anchr.oss-cn-shanghai.aliyuncs.com/anchr-dev/sample.pdf",
             "fileName": "sample.pdf",
         }
@@ -99,8 +101,51 @@ class ApiTest(unittest.TestCase):
         self.assertEqual("ok", status_response.json()["result"]["text"])
         delete_response = self.client.delete(f"/v1/jobs/{job_id}", headers=self.auth)
         self.assertEqual(204, delete_response.status_code)
+        self.assertEqual(
+            204,
+            self.client.delete(f"/v1/jobs/{job_id}", headers=self.auth).status_code,
+        )
         self.assertEqual(404, self.client.get(f"/v1/jobs/{job_id}", headers=self.auth).status_code)
         self.assertEqual(404, self.client.post("/v1/parse", json=self.payload()).status_code)
+
+    def test_v2_requires_source_revision(self) -> None:
+        payload = self.payload()
+        payload.pop("sourceRevision")
+        response = self.client.post("/v1/jobs", json=payload, headers=self.auth)
+        self.assertEqual(422, response.status_code)
+
+    def test_v2_validates_and_normalizes_file_name(self) -> None:
+        for invalid_file_name in (None, "", " \t "):
+            with self.subTest(file_name=invalid_file_name):
+                payload = self.payload()
+                if invalid_file_name is None:
+                    payload.pop("fileName")
+                else:
+                    payload["fileName"] = invalid_file_name
+                response = self.client.post("/v1/jobs", json=payload, headers=self.auth)
+                self.assertEqual(422, response.status_code)
+
+        payload = self.payload()
+        payload["fileName"] = "  sample.pdf  "
+        request = ParseRequest.model_validate(payload)
+        self.assertEqual("sample.pdf", request.file_name)
+
+    def test_v1_and_legacy_allow_missing_file_name(self) -> None:
+        for contract_version in (1, None):
+            with self.subTest(contract_version=contract_version):
+                payload = self.payload()
+                payload["requestId"] = f"legacy-request-{contract_version}"
+                if contract_version is None:
+                    payload.pop("contractVersion")
+                else:
+                    payload["contractVersion"] = contract_version
+                payload.pop("sourceRevision")
+                payload.pop("fileName")
+
+                request = ParseRequest.model_validate(payload)
+                self.assertIsNone(request.file_name)
+                response = self.client.post("/v1/jobs", json=payload, headers=self.auth)
+                self.assertEqual(202, response.status_code)
 
     def test_queue_full_returns_retry_after(self) -> None:
         parser = BlockingStubParser()
