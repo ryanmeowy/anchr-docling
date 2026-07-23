@@ -123,6 +123,10 @@ class JobManagerTest(unittest.IsolatedAsyncioTestCase):
             manager.delete(record.job_id)
             with self.assertRaises(JobNotFoundError):
                 manager.get(record.job_id)
+
+            replacement, replacement_created = manager.submit(request)
+            self.assertTrue(replacement_created)
+            self.assertNotEqual(record.job_id, replacement.job_id)
         finally:
             await manager.stop()
 
@@ -135,6 +139,13 @@ class JobManagerTest(unittest.IsolatedAsyncioTestCase):
             failed = manager.get(record.job_id)
             self.assertEqual("DOCLING_PARSE_ERROR", failed.error.code)
             self.assertEqual("bad document", failed.error.message)
+
+            manager.delete(record.job_id)
+            replacement, replacement_created = manager.submit(
+                make_request("request-failure")
+            )
+            self.assertTrue(replacement_created)
+            self.assertNotEqual(record.job_id, replacement.job_id)
         finally:
             await manager.stop()
 
