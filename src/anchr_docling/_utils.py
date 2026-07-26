@@ -39,6 +39,23 @@ def resolve_bbox(item: Any) -> dict[str, Any] | None:
     return None
 
 
+def resolve_bboxes(item: Any) -> list[dict[str, Any]]:
+    """Return every provenance entry instead of silently dropping all but the first."""
+    resolved: list[dict[str, Any]] = []
+    for provenance in getattr(item, "prov", None) or []:
+        bbox = getattr(provenance, "bbox", None)
+        if bbox is None:
+            continue
+        value = bbox.model_dump(mode="json") if hasattr(bbox, "model_dump") else bbox
+        if not isinstance(value, dict):
+            continue
+        resolved.append({
+            "pageNo": getattr(provenance, "page_no", None),
+            "bbox": value,
+        })
+    return resolved
+
+
 def resolve_parent_ref(item: Any) -> str | None:
     parent = getattr(item, "parent", None)
     return getattr(parent, "cref", None)

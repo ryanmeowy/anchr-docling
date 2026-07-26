@@ -1,3 +1,4 @@
+import hashlib
 import re
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from anchr_docling.images import (
     OssImageUploader,
     _validate_image_size,
     build_image_upload_context,
+    encode_png,
     enrich_markdown_text,
 )
 from anchr_docling.schemas import (
@@ -262,7 +264,8 @@ def _restore_md_images(
     md_images: list[dict[str, str]],
     uploader: "OssImageUploader | None",
     warnings: list[ParseWarning],
-    uploaded_cache: dict[str, str],
+    uploaded_cache: dict[str, Any],
+    images: list[dict[str, Any]] | None = None,
 ) -> str:
     """Replace ``<!-- image -->`` placeholders with markdown image syntax.
 
@@ -281,19 +284,42 @@ def _restore_md_images(
 
         # Try OSS upload.
         final_url: str | None = None
-        if uploader is not None and original_url in uploaded_cache:
-            final_url = uploaded_cache[original_url]
-        elif uploader is not None:
+        if original_url in uploaded_cache:
+            cached = uploaded_cache[original_url]
+            final_url = cached.get("url") if isinstance(cached, dict) else None
+        else:
+            image = None
+            image_key = None
+            upload_status = "SKIPPED"
             try:
                 image = _download_md_image(original_url)
-                if image is not None:
+                if image is not None and uploader is not None:
                     image_key = uploader.upload_png(f"md_image_{index}", image)
                     final_url = uploader.build_image_url(image_key)
-                    uploaded_cache[original_url] = final_url
-                else:
-                    uploaded_cache[original_url] = ""
+                    upload_status = "UPLOADED"
             except Exception:
-                uploaded_cache[original_url] = ""
+                upload_status = "FAILED"
+            artifact = {
+                "artifactVersion": 1,
+                "blockId": f"md_image_{index}",
+                "imageObjectKey": image_key,
+                "uploadStatus": upload_status,
+                "pageNo": None,
+                "bboxes": [],
+                "imageWidth": image.size[0] if image is not None else None,
+                "imageHeight": image.size[1] if image is not None else None,
+                "mimeType": "image/png" if image is not None else None,
+                "contentHash": hashlib.sha256(encode_png(image)).hexdigest()
+                if image is not None else None,
+                "alt": alt or None,
+                "caption": None,
+                "contextText": None,
+                "ocrText": None,
+                "url": final_url,
+            }
+            uploaded_cache[original_url] = artifact
+            if images is not None:
+                images.append(artifact)
 
         if final_url is None:
             final_url = original_url
@@ -494,7 +520,7 @@ def export_parsed_document(
     # Tries OSS upload first, falls back to original URL.
     if md_images and chunks:
         uploader = upload_context.uploader if upload_context is not None else None
-        uploaded_cache: dict[str, str] = {}
+        uploaded_cache: dict[str, Any] = {}
         for chunk in chunks:
             chunk["text"] = _restore_md_images(
                 chunk["text"],
@@ -502,6 +528,7 @@ def export_parsed_document(
                 uploader,
                 warnings,
                 uploaded_cache,
+                images,
             )
 
     # Sanitize formula-related OCR artifacts from text/markdown/chunks output.

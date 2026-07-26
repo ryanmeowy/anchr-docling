@@ -250,7 +250,7 @@ class JobManager:
 
     @staticmethod
     def _fingerprint(request: ParseRequest) -> str:
-        if request.contract_version == 2:
+        if request.contract_version in {2, 3}:
             stable_output = None
             if request.oss is not None:
                 stable_output = {

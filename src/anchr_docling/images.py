@@ -1,8 +1,10 @@
 import base64
+import hashlib
 import json
 import logging
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -10,6 +12,7 @@ from typing import Any
 from anchr_docling._utils import (
     collect_child_text,
     ref_to_block_id,
+    resolve_bboxes,
     resolve_block_type,
     resolve_page_no,
 )
@@ -54,7 +57,15 @@ def build_image_upload_context(
         )
 
     try:
-        credentials = decrypt_oss_credentials(oss_options.encrypted_credentials)
+        credentials = decrypt_oss_credentials(
+            oss_options.encrypted_credentials,
+            credential_aad(
+                request_id,
+                oss_options.bucket,
+                oss_options.base_path,
+                oss_options.endpoint,
+            ),
+        )
         return ImageUploadContext(
             uploader=OssImageUploader(
                 endpoint=oss_options.endpoint,
@@ -169,7 +180,7 @@ def enrich_markdown_text(
     markdown_text: str,
     upload_context: ImageUploadContext | None,
     warnings: list[ParseWarning],
-    image_cache: dict[str, str | None],
+    image_cache: dict[str, Any],
     page_no: int | None = None,
     images: list[dict[str, Any]] | None = None,
 ) -> str:
@@ -180,9 +191,8 @@ def enrich_markdown_text(
     avoids uploading the same picture more than once (shared between
     document-level and per-page texts).
 
-    When *images* is provided, each picture is appended as a structured
-    dict (``url``, ``pageNo``, ``blockId``, ``alt``) for the top-level
-    ``images`` response field.
+    The top-level image list is the durable v1 artifact manifest. URLs are
+    used only to render the returned markdown and are never artifact identity.
     """
     placeholder = "<!-- image -->"
     if placeholder not in markdown_text:
@@ -213,9 +223,10 @@ def enrich_markdown_text(
     for item, block_id in picture_items:
         self_ref: str = getattr(item, "self_ref", "")
 
-        # Cache hit: reuse previously resolved URL (or None).
+        # Cache hit: reuse the complete artifact and do not duplicate it.
         if self_ref in image_cache:
-            image_urls.append(image_cache[self_ref])
+            cached = image_cache[self_ref]
+            image_urls.append(cached.get("url") if isinstance(cached, dict) else None)
             alt_texts.append(
                 image_cache.get(f"{self_ref}_alt", "") or ""
             )
@@ -226,15 +237,23 @@ def enrich_markdown_text(
         image_cache[f"{self_ref}_alt"] = alt_text
 
         url: str | None = None
+        image_key: str | None = None
+        upload_status = "SKIPPED"
+        width: int | None = None
+        height: int | None = None
+        content_hash: str | None = None
+        image = get_picture_image(document, item)
+        if image is not None:
+            width, height = image.size
+            content_hash = hashlib.sha256(encode_png(image)).hexdigest()
         if upload_context is not None and upload_context.uploader is not None:
-            image = get_picture_image(document, item)
             if image is not None:
                 try:
-                    image_key = upload_context.uploader.upload_png(
-                        block_id, image
-                    )
+                    image_key = upload_context.uploader.upload_png(block_id, image)
                     url = upload_context.uploader.build_image_url(image_key)
+                    upload_status = "UPLOADED"
                 except Exception:
+                    upload_status = "FAILED"
                     add_warning(
                         warnings,
                         code="image_upload_failed",
@@ -242,17 +261,38 @@ def enrich_markdown_text(
                         block_id=block_id,
                     )
 
+        bboxes = resolve_bboxes(item)
+        item_page_no = resolve_page_no(document, item)
+        if not bboxes and item_page_no is None:
+            add_warning(
+                warnings,
+                code="image_provenance_missing",
+                message="Embedded image has no page or bounding-box provenance.",
+                block_id=block_id,
+            )
+        artifact = {
+            "artifactVersion": 1,
+            "blockId": block_id,
+            "imageObjectKey": image_key,
+            "uploadStatus": upload_status,
+            "pageNo": item_page_no,
+            "bboxes": bboxes,
+            "imageWidth": width,
+            "imageHeight": height,
+            "mimeType": "image/png" if image is not None else None,
+            "contentHash": content_hash,
+            "alt": alt_text or None,
+            "caption": alt_text or None,
+            "contextText": "\n".join(collect_child_text(document, item)) or None,
+            "ocrText": None,
+            # Compatibility-only rendering field. Consumers must use imageObjectKey.
+            "url": url,
+        }
         image_urls.append(url)
-        image_cache[self_ref] = url
+        image_cache[self_ref] = artifact
 
         if images is not None:
-            item_page_no = resolve_page_no(document, item)
-            images.append({
-                "url": url,
-                "pageNo": item_page_no,
-                "blockId": block_id,
-                "alt": alt_text,
-            })
+            images.append(artifact)
 
     # Replace placeholders one at a time, in order.
     result = markdown_text
@@ -322,26 +362,46 @@ def encode_png(image: Any) -> bytes:
     return output.getvalue()
 
 
-def decrypt_oss_credentials(encrypted: EncryptedCredentials) -> OssCredentials:
+def credential_aad(
+    request_id: str | None, bucket: str, base_path: str, endpoint: str
+) -> bytes:
+    return "\n".join((request_id or "", bucket, base_path, endpoint)).encode("utf-8")
+
+
+def decrypt_oss_credentials(
+    encrypted: EncryptedCredentials, aad: bytes
+) -> OssCredentials:
     try:
-        from cryptography.hazmat.primitives import padding
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     except ImportError as exc:
         raise ImageUploadError("cryptography is not installed") from exc
 
     key = load_oss_encrypt_key()
-    iv = decode_base64_field(encrypted.iv, "iv")
+    if (
+        encrypted.version != 1
+        or not encrypted.key_id
+        or not encrypted.nonce
+        or not encrypted.tag
+        or not encrypted.expiration
+    ):
+        raise ImageUploadError("AEAD encrypted credentials are incomplete")
+    nonce = decode_base64_field(encrypted.nonce, "nonce")
     ciphertext = decode_base64_field(encrypted.ciphertext, "ciphertext")
-    if len(iv) != 16:
-        raise ImageUploadError("encrypted credentials iv must be 16 bytes")
+    tag = decode_base64_field(encrypted.tag, "tag")
+    if len(nonce) != 12:
+        raise ImageUploadError("encrypted credentials nonce must be 12 bytes")
+    if len(tag) != 16:
+        raise ImageUploadError("encrypted credentials tag must be 16 bytes")
+    plaintext = AESGCM(key).decrypt(nonce, ciphertext + tag, aad)
 
-    decryptor = Cipher(
-        algorithms.AES256(key), modes.CBC(iv)
-    ).decryptor()
-
-    padded = decryptor.update(ciphertext) + decryptor.finalize()
-    unpadder = padding.PKCS7(128).unpadder()
-    plaintext = unpadder.update(padded) + unpadder.finalize()
+    try:
+        expiration = datetime.fromisoformat(
+            encrypted.expiration.replace("Z", "+00:00")
+        )
+    except ValueError as exc:
+        raise ImageUploadError("encrypted credentials expiration is invalid") from exc
+    if expiration.tzinfo is None or expiration <= datetime.now(UTC):
+        raise ImageUploadError("encrypted credentials have expired")
 
     payload = json.loads(plaintext.decode("utf-8"))
     return OssCredentials(
