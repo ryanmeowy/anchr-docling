@@ -78,6 +78,12 @@ class DoclingParser:
             _validate_image_size(source_path)
             parsed = convert_document(source_path, request.options, request.oss, request.request_id)
 
+        if (
+            file_type != "image"
+            and (not parsed.quality_text or not parsed.quality_text.strip())
+        ):
+            raise DoclingParseError("docling returned empty content")
+
         return ParseResponse(
             requestId=request.request_id,
             parser="docling",
@@ -233,8 +239,6 @@ def convert_document(
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
 
-    if not parsed.quality_text or not parsed.quality_text.strip():
-        raise DoclingParseError("docling returned empty content")
     if options.validate_text_quality and looks_garbled(parsed.quality_text):
         raise DoclingParseError(
             "docling returned garbled text. The PDF may use custom font encoding; retry with "

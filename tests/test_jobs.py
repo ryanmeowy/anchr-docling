@@ -69,6 +69,19 @@ class ImmediateParser:
         return make_response(request)
 
 
+class EmptyContentParser:
+    def parse(self, request: ParseRequest) -> ParseResponse:
+        return ParseResponse(
+            requestId=request.request_id,
+            parser="docling",
+            format="chunks",
+            fileType="image",
+            text="",
+            pages=[],
+            chunks=[],
+        )
+
+
 class FailingParser:
     def parse(self, request: ParseRequest) -> ParseResponse:
         raise DoclingParseError("bad document")
@@ -146,6 +159,20 @@ class JobManagerTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertTrue(replacement_created)
             self.assertNotEqual(record.job_id, replacement.job_id)
+        finally:
+            await manager.stop()
+
+    async def test_empty_content_is_a_successful_parse_result(self) -> None:
+        manager = JobManager(EmptyContentParser(), make_settings())
+        await manager.start()
+        try:
+            record, _ = manager.submit(make_request("request-empty", "sample.png"))
+            await wait_for_status(manager, record.job_id, JobStatus.SUCCEEDED)
+
+            completed = manager.get(record.job_id)
+            self.assertEqual("", completed.result.text)
+            self.assertEqual([], completed.result.chunks)
+            self.assertIsNone(completed.error)
         finally:
             await manager.stop()
 

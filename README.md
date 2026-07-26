@@ -151,6 +151,9 @@ curl http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
 
 状态依次为 `queued`、`running`、`succeeded` 或 `failed`。成功时 `result` 字段包含下述解析响应；Spring 读取成功结果后会确认并释放内存：
 
+图片文件没有提取到文本时仍返回 `succeeded`，其中 `text` 为空字符串、`chunks`
+为空数组；PDF、DOCX 等非图片文件的空结果仍返回 `DOCLING_PARSE_ERROR`。
+
 ```bash
 curl -X DELETE http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
   -H "Authorization: Bearer $ANCHR_DOCLING_API_TOKEN"
