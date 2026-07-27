@@ -10,6 +10,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from anchr_docling.config import settings
 from anchr_docling.docling_parser import export_parsed_document
 from anchr_docling.images import (
+    OssCredentials,
+    OssImageUploader,
     attach_picture_image_metadata,
     credential_aad,
     decrypt_oss_credentials,
@@ -142,6 +144,39 @@ class EmbeddedImageUploadTest(unittest.TestCase):
         dumped = artifact.model_dump(by_alias=True)
         self.assertEqual([2, 3], [entry["pageNo"] for entry in dumped["bboxes"]])
         self.assertEqual("BOTTOMLEFT", dumped["bboxes"][0]["bbox"]["coordOrigin"])
+
+    def test_attempt_prefix_layout_uses_stable_block_key(self) -> None:
+        uploader = OssImageUploader(
+            endpoint="oss.example.test",
+            bucket_name="bucket-a",
+            base_path="embedded/ingestion/task-1/item-1/parse/2/images/",
+            credentials=OssCredentials("id", "secret", "token"),
+            request_id="task-1:item-1:2",
+            object_key_layout="ATTEMPT_PREFIX_V1",
+        )
+
+        self.assertEqual(
+            "embedded/ingestion/task-1/item-1/parse/2/images/pictures_0.png",
+            uploader.build_image_key("pictures/0"),
+        )
+        self.assertEqual(
+            uploader.build_image_key("pictures/0"),
+            uploader.build_image_key("pictures/0"),
+        )
+
+    def test_legacy_layout_keeps_request_suffix(self) -> None:
+        uploader = OssImageUploader(
+            endpoint="oss.example.test",
+            bucket_name="bucket-a",
+            base_path="embedded",
+            credentials=OssCredentials("id", "secret", "token"),
+            request_id="task-1:item-1:2",
+        )
+
+        self.assertEqual(
+            "embedded/pictures_0_task-1_item-1_2.png",
+            uploader.build_image_key("pictures/0"),
+        )
 
 
 if __name__ == "__main__":

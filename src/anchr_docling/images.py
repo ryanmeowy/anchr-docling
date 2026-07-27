@@ -73,6 +73,7 @@ def build_image_upload_context(
                 base_path=oss_options.base_path,
                 credentials=credentials,
                 request_id=request_id,
+                object_key_layout=oss_options.object_key_layout,
             )
         )
     except Exception as exc:
@@ -314,12 +315,14 @@ class OssImageUploader:
         base_path: str,
         credentials: OssCredentials,
         request_id: str | None = None,
+        object_key_layout: str | None = None,
     ) -> None:
         self.endpoint = endpoint
         self.bucket_name = bucket_name
         self.base_path = base_path.strip("/")
         self.credentials = credentials
         self.request_id = request_id
+        self.object_key_layout = object_key_layout
 
     def upload_png(self, block_id: str, image: Any) -> str:
         try:
@@ -339,9 +342,16 @@ class OssImageUploader:
         return image_key
 
     def build_image_key(self, block_id: str) -> str:
+        stem = sanitize_object_key_segment(block_id)
+        if self.object_key_layout == "ATTEMPT_PREFIX_V1":
+            filename = f"{stem}.png"
+            if not self.base_path:
+                raise ImageUploadError(
+                    "attempt-prefix image layout requires a non-empty base path"
+                )
+            return f"{self.base_path}/{filename}"
         suffix = self.request_id or str(int(time.time() * 1000))
         safe_suffix = suffix.replace("/", "_").replace(":", "_")
-        stem = block_id.replace("/", "_")
         filename = f"{stem}_{safe_suffix}.png"
         if not self.base_path:
             return filename
@@ -354,6 +364,18 @@ class OssImageUploader:
         """
         return f"https://{self.bucket_name}.{self.endpoint}/{image_key}"
 
+
+
+def sanitize_object_key_segment(value: str) -> str:
+    normalized = "".join(
+        character
+        if character.isalnum() or character in {"-", "_", "."}
+        else "_"
+        for character in value.strip()
+    )
+    if not normalized or normalized in {".", ".."}:
+        raise ImageUploadError("image block id is not a safe object-key segment")
+    return normalized
 
 
 def encode_png(image: Any) -> bytes:

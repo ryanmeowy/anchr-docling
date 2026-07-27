@@ -53,6 +53,9 @@ class OssUploadOptions(BaseModel):
     endpoint: str
     bucket: str
     base_path: str = Field(default="", alias="basePath")
+    object_key_layout: Literal["ATTEMPT_PREFIX_V1"] | None = Field(
+        default=None, alias="objectKeyLayout"
+    )
     encrypted_credentials: EncryptedCredentials = Field(alias="encryptedCredentials")
 
     model_config = ConfigDict(populate_by_name=True)
