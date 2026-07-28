@@ -1,5 +1,46 @@
-from pydantic import Field, SecretStr
+import unicodedata
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def normalize_upload_prefix(value: str) -> str:
+    normalized = value.strip().strip("/")
+    if not normalized:
+        raise ValueError("upload target prefix must not be empty")
+    if "\\" in normalized or any(
+        unicodedata.category(character) == "Cc" for character in normalized
+    ):
+        raise ValueError("upload target prefix contains unsafe characters")
+    segments = normalized.split("/")
+    if any(segment in {"", ".", ".."} for segment in segments):
+        raise ValueError("upload target prefix contains unsafe path segments")
+    if "*" in normalized:
+        raise ValueError("upload target prefix does not support wildcards")
+    return normalized
+
+
+class UploadTargetRule(BaseModel):
+    endpoint: str
+    bucket: str
+    prefix: str
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("endpoint", "bucket")
+    @classmethod
+    def validate_exact_field(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("upload target fields must not be empty")
+        if "*" in normalized:
+            raise ValueError("upload target fields do not support wildcards")
+        return normalized
+
+    @field_validator("prefix")
+    @classmethod
+    def validate_prefix(cls, value: str) -> str:
+        return normalize_upload_prefix(value)
 
 
 class Settings(BaseSettings):
@@ -52,6 +93,10 @@ class Settings(BaseSettings):
     allowed_download_hosts: str = Field(
         default="",
         alias="ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS",
+    )
+    allowed_upload_targets: list[UploadTargetRule] = Field(
+        default_factory=list,
+        alias="ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS",
     )
     max_download_redirects: int = Field(
         default=3,

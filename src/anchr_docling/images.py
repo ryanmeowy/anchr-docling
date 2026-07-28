@@ -24,6 +24,7 @@ from anchr_docling.errors import (
     sanitize_error_message,
 )
 from anchr_docling.schemas import EncryptedCredentials, OssUploadOptions, ParseWarning
+from anchr_docling.security import validate_upload_target
 
 _log = logging.getLogger(__name__)
 
@@ -54,6 +55,26 @@ def build_image_upload_context(
             uploader=None,
             unavailable_code="image_upload_skipped_no_credentials",
             unavailable_message="OSS credentials were not provided; image upload was skipped.",
+        )
+
+    try:
+        validate_upload_target(
+            oss_options.endpoint,
+            oss_options.bucket,
+            oss_options.base_path,
+            settings,
+        )
+    except ImageUploadError:
+        message = "OSS upload target is not allowed."
+        add_warning(
+            warnings,
+            code="image_upload_target_not_allowed",
+            message=message,
+        )
+        return ImageUploadContext(
+            uploader=None,
+            unavailable_code="image_upload_target_not_allowed",
+            unavailable_message=message,
         )
 
     try:

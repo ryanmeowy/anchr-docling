@@ -257,9 +257,10 @@ class JobManager:
                     "endpoint": request.oss.endpoint,
                     "bucket": request.oss.bucket,
                     "basePath": request.oss.base_path,
+                    "objectKeyLayout": request.oss.object_key_layout,
                 }
             payload = {
-                "contractVersion": 2,
+                "contractVersion": request.contract_version,
                 "requestId": request.request_id,
                 "sourceRevision": request.source_revision,
                 "fileName": request.file_name,

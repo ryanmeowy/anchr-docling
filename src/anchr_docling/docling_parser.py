@@ -266,7 +266,8 @@ def _restore_md_images(
     warnings: list[ParseWarning],
     uploaded_cache: dict[str, Any],
     images: list[dict[str, Any]] | None = None,
-) -> str:
+    start_index: int = 0,
+) -> tuple[str, int]:
     """Replace ``<!-- image -->`` placeholders with markdown image syntax.
 
     Tries OSS upload first; falls back to the original URL.
@@ -274,9 +275,9 @@ def _restore_md_images(
     """
     placeholder = "<!-- image -->"
     if placeholder not in text:
-        return text
+        return text, start_index
 
-    index = 0
+    index = start_index
     while placeholder in text and index < len(md_images):
         info = md_images[index]
         alt = info["alt"]
@@ -327,7 +328,7 @@ def _restore_md_images(
         text = text.replace(placeholder, f"![{alt}]({final_url})", 1)
         index += 1
 
-    return text
+    return text, index
 
 
 def _download_md_image(url: str) -> Any | None:
@@ -521,14 +522,16 @@ def export_parsed_document(
     if md_images and chunks:
         uploader = upload_context.uploader if upload_context is not None else None
         uploaded_cache: dict[str, Any] = {}
+        md_image_index = 0
         for chunk in chunks:
-            chunk["text"] = _restore_md_images(
+            chunk["text"], md_image_index = _restore_md_images(
                 chunk["text"],
                 md_images,
                 uploader,
                 warnings,
                 uploaded_cache,
                 images,
+                md_image_index,
             )
 
     # Sanitize formula-related OCR artifacts from text/markdown/chunks output.

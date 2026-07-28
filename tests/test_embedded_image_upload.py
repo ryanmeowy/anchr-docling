@@ -7,16 +7,22 @@ from unittest.mock import patch
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from anchr_docling.config import settings
+from anchr_docling.config import UploadTargetRule, settings
 from anchr_docling.docling_parser import export_parsed_document
 from anchr_docling.images import (
     OssCredentials,
     OssImageUploader,
     attach_picture_image_metadata,
+    build_image_upload_context,
     credential_aad,
     decrypt_oss_credentials,
 )
-from anchr_docling.schemas import EmbeddedImageArtifact, EncryptedCredentials, ParseOptions
+from anchr_docling.schemas import (
+    EmbeddedImageArtifact,
+    EncryptedCredentials,
+    OssUploadOptions,
+    ParseOptions,
+)
 
 
 class _FakeImage:
@@ -124,6 +130,50 @@ class EmbeddedImageUploadTest(unittest.TestCase):
                     envelope,
                     credential_aad("request-2", "bucket-a", "embedded/", "oss.example.test"),
                 )
+
+    def test_disallowed_upload_target_is_rejected_before_decryption(self) -> None:
+        options = OssUploadOptions(
+            endpoint="oss.denied.test",
+            bucket="bucket-a",
+            basePath="embedded/ingestion/task-1/images/",
+            objectKeyLayout="ATTEMPT_PREFIX_V1",
+            encryptedCredentials=EncryptedCredentials(
+                version=1,
+                keyId="app-security-v1",
+                nonce="nonce",
+                ciphertext="ciphertext",
+                tag="tag",
+                expiration="2099-01-01T00:00:00Z",
+            ),
+        )
+        warnings = []
+        allowed = [
+            UploadTargetRule(
+                endpoint="oss.allowed.test",
+                bucket="bucket-a",
+                prefix="embedded/",
+            )
+        ]
+
+        with (
+            patch.object(settings, "allowed_upload_targets", allowed),
+            patch("anchr_docling.images.decrypt_oss_credentials") as decrypt,
+            patch("anchr_docling.images.OssImageUploader") as uploader,
+        ):
+            context = build_image_upload_context(
+                options,
+                warnings,
+                request_id="request-1",
+            )
+
+        self.assertIsNone(context.uploader)
+        self.assertEqual("image_upload_target_not_allowed", context.unavailable_code)
+        self.assertEqual(
+            ["image_upload_target_not_allowed"],
+            [warning.code for warning in warnings],
+        )
+        decrypt.assert_not_called()
+        uploader.assert_not_called()
 
     def test_artifact_preserves_all_picture_provenance_coordinates(self) -> None:
         artifact = EmbeddedImageArtifact.model_validate({

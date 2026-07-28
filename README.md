@@ -103,14 +103,19 @@ App 新协议使用 `contractVersion=2`。v2 指纹包含 `requestId`、`sourceR
 | `endpoint` | string | **是** | — | OSS endpoint，如 `oss-cn-hangzhou.aliyuncs.com` |
 | `bucket` | string | **是** | — | OSS bucket 名称 |
 | `basePath` | string | 否 | `""` | 图片 key 的前缀路径 |
+| `objectKeyLayout` | string | v3 是 | — | v3 使用 `ATTEMPT_PREFIX_V1`，在 attempt 独占目录内按稳定 blockId 命名 |
 | `encryptedCredentials` | object | **是** | — | 加密后的 STS 临时凭证 |
 
 ##### oss.encryptedCredentials
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `iv` | string | **是** | AES-256-CBC IV，16 字节，base64 |
-| `ciphertext` | string | **是** | AES-256-CBC 密文，base64 |
+| `version` | int | v3 是 | AEAD envelope 版本，当前为 `1` |
+| `keyId` | string | v3 是 | 加密密钥标识 |
+| `nonce` | string | v3 是 | AES-GCM nonce，base64 |
+| `ciphertext` | string | **是** | AES-GCM 密文，base64 |
+| `tag` | string | v3 是 | AES-GCM authentication tag，base64 |
+| `expiration` | string | v3 是 | 临时凭证 envelope 过期时间 |
 
 #### 示例请求
 
@@ -321,60 +326,62 @@ curl -X DELETE http://<Mac的Tailscale-IP>:8091/v1/jobs/<jobId> \
 
 文档内嵌图片上传默认关闭。调用方必须同时显式设置 `includeEmbeddedImages=true` 并提供 OSS 凭证，服务才会尝试从 PDF 中提取图片并上传。支持 `markdown`、`blocks`、`chunks` 三种输出格式。
 
-> 当前 AES-CBC 凭据协议仅为遗留兼容，不应在生产环境启用。Anchr app 默认发送 `includeEmbeddedImages=false` 且不发送 STS；待版本化 AEAD 协议、图片消费者和对象生命周期完整实现后再重新开放。
+生产图片上传使用 contract v3 的 AES-GCM 凭据 envelope。凭据通过 AAD 绑定
+`requestId`、`bucket`、`basePath` 和 `endpoint`，并且目标必须命中 Docling
+环境中的原子上传白名单。空白名单允许服务启动，但拒绝全部图片上传。
+
+```bash
+export ANCHR_DOCLING_OSS_ENCRYPT_KEY="<32 字节密钥，原文或 base64>"
+export ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS='[
+  {
+    "endpoint": "oss-cn-hangzhou.aliyuncs.com",
+    "bucket": "my-bucket",
+    "prefix": "embedded/"
+  }
+]'
+```
+
+每条白名单规则绑定完整的 endpoint、bucket 和 prefix；不同规则之间不会交叉组合，
+prefix 只匹配自身或按 `/` 分隔的子目录，不支持通配符。
 
 ### 请求
 
 ```json
 {
+  "requestId": "task-1:item-1:1",
+  "contractVersion": 3,
+  "sourceRevision": "v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "sourceUrl": "https://example.com/document.pdf",
+  "fileName": "document.pdf",
   "options": {
-    "outputFormat": "markdown",
+    "outputFormat": "chunks",
     "includeEmbeddedImages": true
   },
   "oss": {
     "endpoint": "oss-cn-hangzhou.aliyuncs.com",
     "bucket": "my-bucket",
-    "basePath": "docling-images",
+    "basePath": "embedded/ingestion/task-1/item-1/parse/1/images/",
+    "objectKeyLayout": "ATTEMPT_PREFIX_V1",
     "encryptedCredentials": {
-      "iv": "<base64, 16 字节>",
-      "ciphertext": "<base64>"
+      "version": 1,
+      "keyId": "app-security-v1",
+      "nonce": "<base64>",
+      "ciphertext": "<base64>",
+      "tag": "<base64>",
+      "expiration": "2026-07-28T12:00:00Z"
     }
   }
 }
 ```
 
-| 字段 | 说明 |
-|-------|------|
-| `endpoint` | OSS endpoint，如 `oss-cn-hangzhou.aliyuncs.com` |
-| `bucket` | OSS bucket 名称 |
-| `basePath` | 可选，图片 key 的前缀路径 |
-| `encryptedCredentials.iv` | AES-256-CBC IV，16 字节，base64 编码 |
-| `encryptedCredentials.ciphertext` | AES-256-CBC 密文，base64 编码 |
-
-`ciphertext` 解密后的明文为 JSON：
-
-```json
-{
-  "accessKeyId": "STS.xxx",
-  "accessKeySecret": "xxx",
-  "securityToken": "xxx",
-  "expiration": "2026-06-10T00:00:00Z"
-}
-```
-
-加密方式为 AES-256-CBC + PKCS7Padding。32 字节密钥在服务端配置：
-
-```bash
-export ANCHR_DOCLING_OSS_ENCRYPT_KEY="<32 字节密钥，原文或 base64>"
-```
-
 ### 图片 key 格式
 
 ```
-{basePath}/pictures_0_{requestId}.png
+{basePath}/{sanitizedBlockId}.png
 ```
 
-`requestId` 中的 `/` 和 `:` 会被替换为 `_`。`requestId` 为空时使用毫秒时间戳兜底，确保不同文档的图片不会重名覆盖。
+`ATTEMPT_PREFIX_V1` 要求 `basePath` 非空。App 为每个 parse attempt 生成独占目录，
+同一 attempt 重试时相同 blockId 得到相同对象 key。
 
 ### 图片输出
 
@@ -384,7 +391,9 @@ export ANCHR_DOCLING_OSS_ENCRYPT_KEY="<32 字节密钥，原文或 base64>"
 {
   "images": [
     {
-      "url": "https://my-bucket.oss-cn-hangzhou.aliyuncs.com/docling-images/pictures_0_task_1_item_42.png",
+      "artifactVersion": 1,
+      "imageObjectKey": "embedded/ingestion/task-1/item-1/parse/1/images/pictures_0.png",
+      "uploadStatus": "UPLOADED",
       "pageNo": 1,
       "blockId": "pictures/0",
       "alt": "图 1：架构总览"
@@ -393,7 +402,8 @@ export ANCHR_DOCLING_OSS_ENCRYPT_KEY="<32 字节密钥，原文或 base64>"
 }
 ```
 
-未提供 OSS 凭证时 `images` 为 `null`。
+响应 URL 仅用于诊断和返回 Markdown 渲染；持久化身份是 `imageObjectKey`。未提供凭证、
+白名单不匹配或上传失败时，文本解析继续完成，并通过 `warnings` 和图片上传状态降级。
 
 ## 注意事项
 

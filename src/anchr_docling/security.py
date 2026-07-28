@@ -6,8 +6,8 @@ import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from anchr_docling.config import Settings
-from anchr_docling.errors import SourceDownloadError
+from anchr_docling.config import Settings, normalize_upload_prefix
+from anchr_docling.errors import ImageUploadError, SourceDownloadError
 
 bearer_scheme = HTTPBearer(auto_error=False)
 _REDIRECT_STATUSES = {301, 302, 303, 307, 308}
@@ -47,6 +47,32 @@ def validate_download_url(url: str, settings: Settings) -> None:
         raise SourceDownloadError("download URL contains an invalid port") from exc
     if port not in (None, 443):
         raise SourceDownloadError("download URL must use the default HTTPS port")
+
+
+def validate_upload_target(
+    endpoint: str,
+    bucket: str,
+    base_path: str,
+    settings: Settings,
+) -> None:
+    normalized_endpoint = endpoint.strip()
+    normalized_bucket = bucket.strip()
+    try:
+        normalized_base_path = normalize_upload_prefix(base_path)
+    except ValueError as exc:
+        raise ImageUploadError("OSS upload target is not allowed") from exc
+
+    for target in settings.allowed_upload_targets:
+        if (
+            target.endpoint == normalized_endpoint
+            and target.bucket == normalized_bucket
+            and (
+                normalized_base_path == target.prefix
+                or normalized_base_path.startswith(f"{target.prefix}/")
+            )
+        ):
+            return
+    raise ImageUploadError("OSS upload target is not allowed")
 
 
 def open_validated_response(
