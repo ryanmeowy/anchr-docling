@@ -105,11 +105,6 @@ def create_app(
         manager: JobManager = application.state.jobs
         try:
             manager.delete(job_id)
-        except JobNotFoundError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="job not found",
-            ) from exc
         except ActiveJobError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

@@ -1,3 +1,4 @@
+import hashlib
 import re
 import tempfile
 from pathlib import Path
@@ -17,6 +18,7 @@ from anchr_docling.images import (
     OssImageUploader,
     _validate_image_size,
     build_image_upload_context,
+    encode_png,
     enrich_markdown_text,
 )
 from anchr_docling.schemas import (
@@ -77,6 +79,12 @@ class DoclingParser:
             download_source(str(request.source_url), source_path)
             _validate_image_size(source_path)
             parsed = convert_document(source_path, request.options, request.oss, request.request_id)
+
+        if (
+            file_type != "image"
+            and (not parsed.quality_text or not parsed.quality_text.strip())
+        ):
+            raise DoclingParseError("docling returned empty content")
 
         return ParseResponse(
             requestId=request.request_id,
@@ -233,8 +241,6 @@ def convert_document(
     except Exception as exc:
         raise DoclingParseError(f"docling parse failed: {exc}") from exc
 
-    if not parsed.quality_text or not parsed.quality_text.strip():
-        raise DoclingParseError("docling returned empty content")
     if options.validate_text_quality and looks_garbled(parsed.quality_text):
         raise DoclingParseError(
             "docling returned garbled text. The PDF may use custom font encoding; retry with "
@@ -258,8 +264,10 @@ def _restore_md_images(
     md_images: list[dict[str, str]],
     uploader: "OssImageUploader | None",
     warnings: list[ParseWarning],
-    uploaded_cache: dict[str, str],
-) -> str:
+    uploaded_cache: dict[str, Any],
+    images: list[dict[str, Any]] | None = None,
+    start_index: int = 0,
+) -> tuple[str, int]:
     """Replace ``<!-- image -->`` placeholders with markdown image syntax.
 
     Tries OSS upload first; falls back to the original URL.
@@ -267,9 +275,9 @@ def _restore_md_images(
     """
     placeholder = "<!-- image -->"
     if placeholder not in text:
-        return text
+        return text, start_index
 
-    index = 0
+    index = start_index
     while placeholder in text and index < len(md_images):
         info = md_images[index]
         alt = info["alt"]
@@ -277,19 +285,42 @@ def _restore_md_images(
 
         # Try OSS upload.
         final_url: str | None = None
-        if uploader is not None and original_url in uploaded_cache:
-            final_url = uploaded_cache[original_url]
-        elif uploader is not None:
+        if original_url in uploaded_cache:
+            cached = uploaded_cache[original_url]
+            final_url = cached.get("url") if isinstance(cached, dict) else None
+        else:
+            image = None
+            image_key = None
+            upload_status = "SKIPPED"
             try:
                 image = _download_md_image(original_url)
-                if image is not None:
+                if image is not None and uploader is not None:
                     image_key = uploader.upload_png(f"md_image_{index}", image)
                     final_url = uploader.build_image_url(image_key)
-                    uploaded_cache[original_url] = final_url
-                else:
-                    uploaded_cache[original_url] = ""
+                    upload_status = "UPLOADED"
             except Exception:
-                uploaded_cache[original_url] = ""
+                upload_status = "FAILED"
+            artifact = {
+                "artifactVersion": 1,
+                "blockId": f"md_image_{index}",
+                "imageObjectKey": image_key,
+                "uploadStatus": upload_status,
+                "pageNo": None,
+                "bboxes": [],
+                "imageWidth": image.size[0] if image is not None else None,
+                "imageHeight": image.size[1] if image is not None else None,
+                "mimeType": "image/png" if image is not None else None,
+                "contentHash": hashlib.sha256(encode_png(image)).hexdigest()
+                if image is not None else None,
+                "alt": alt or None,
+                "caption": None,
+                "contextText": None,
+                "ocrText": None,
+                "url": final_url,
+            }
+            uploaded_cache[original_url] = artifact
+            if images is not None:
+                images.append(artifact)
 
         if final_url is None:
             final_url = original_url
@@ -297,7 +328,7 @@ def _restore_md_images(
         text = text.replace(placeholder, f"![{alt}]({final_url})", 1)
         index += 1
 
-    return text
+    return text, index
 
 
 def _download_md_image(url: str) -> Any | None:
@@ -398,7 +429,8 @@ def export_parsed_document(
     warnings: list[ParseWarning] = []
     upload_context = (
         build_image_upload_context(oss_options, warnings, request_id=request_id)
-        if output_format in {"blocks", "markdown", "chunks"}
+        if options.include_embedded_images
+        and output_format in {"blocks", "markdown", "chunks"}
         else None
     )
     blocks = (
@@ -489,14 +521,17 @@ def export_parsed_document(
     # Tries OSS upload first, falls back to original URL.
     if md_images and chunks:
         uploader = upload_context.uploader if upload_context is not None else None
-        uploaded_cache: dict[str, str] = {}
+        uploaded_cache: dict[str, Any] = {}
+        md_image_index = 0
         for chunk in chunks:
-            chunk["text"] = _restore_md_images(
+            chunk["text"], md_image_index = _restore_md_images(
                 chunk["text"],
                 md_images,
                 uploader,
                 warnings,
                 uploaded_cache,
+                images,
+                md_image_index,
             )
 
     # Sanitize formula-related OCR artifacts from text/markdown/chunks output.
