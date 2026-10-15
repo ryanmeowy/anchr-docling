@@ -2,7 +2,7 @@
 
 # Anchr Docling
 
-**Anchr 的文档解析 sidecar。**
+**The document parsing sidecar for Anchr.**
 
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![Docling](https://img.shields.io/badge/Docling-2.58%2B-6f42c1?style=flat-square)](https://github.com/docling-project/docling)
@@ -13,39 +13,39 @@
 
 ---
 
-Anchr Docling 为 [Anchr App](https://github.com/ryanmeowy/anchr-app) 提供文档解析能力。App 提交带签名的 HTTPS 下载地址，服务在受限队列中运行 Docling，并返回 Markdown、纯文本、结构化文档、Block 或 Chunk。需要时，服务也可以把文档内嵌图片上传到指定的阿里云 OSS 目录。
+Anchr Docling provides document parsing for [Anchr App](https://github.com/ryanmeowy/anchr-app). The app submits a signed HTTPS download URL, and the service runs Docling through a bounded queue to return Markdown, plain text, structured documents, blocks, or chunks. It can also upload embedded document images to a specified Alibaba Cloud OSS directory when needed.
 
-这个仓库不保存知识库、文档或入库任务。任务状态和幂等记录只存在于进程内存中；App 负责持久化 parse identity，并在 sidecar 重启后重新提交任务。
+This service does not store knowledge bases, documents, or ingestion tasks. Job status and idempotency records live only in process memory. The app persists the parse identity and resubmits jobs after the sidecar restarts.
 
-## 工作方式
+## How It Works
 
 ```mermaid
 flowchart LR
-    APP["Anchr App"] -->|"Bearer Token · 异步任务"| API["Anchr Docling"]
-    API --> QUEUE["有界内存队列"]
-    QUEUE --> PARSER["Docling 转换器"]
-    PARSER -->|"HTTPS 白名单"| SOURCE["源文件"]
-    PARSER -.->|"可选 · v3"| OSS["阿里云 OSS"]
-    PARSER -->|"文本 · Pages · Blocks / Chunks · Images"| APP
+    APP["Anchr App"] -->|"Bearer Token · Async jobs"| API["Anchr Docling"]
+    API --> QUEUE["Bounded in-memory queue"]
+    QUEUE --> PARSER["Docling converter"]
+    PARSER -->|"HTTPS allowlist"| SOURCE["Source file"]
+    PARSER -.->|"Optional · v3"| OSS["Alibaba Cloud OSS"]
+    PARSER -->|"Text · Pages · Blocks / Chunks · Images"| APP
 ```
 
-- `POST /v1/jobs` 提交任务，`GET /v1/jobs/{jobId}` 查询结果，`DELETE /v1/jobs/{jobId}` 确认终态结果。
-- 默认启动 1 个 worker，等待队列容量为 8。队列满时返回 `429`，并携带 `Retry-After: 5`。
-- `requestId` 是幂等键。稳定输入相同的重复请求返回原任务；同一 ID 对应不同稳定输入时返回 `409`。
-- 源文件只能从本地配置的 HTTPS 主机白名单下载。调用方不能通过请求修改白名单。
-- 解析结果默认保留 10 分钟，最多保留 16 个终态任务。确认、过期或服务重启后，结果不再可查。
+- `POST /v1/jobs` submits a job, `GET /v1/jobs/{jobId}` retrieves its result, and `DELETE /v1/jobs/{jobId}` acknowledges a terminal result.
+- By default, the service starts one worker with a waiting queue capacity of 8. A full queue returns `429` with `Retry-After: 5`.
+- `requestId` is the idempotency key. Repeated requests with the same stable inputs return the original job; the same ID with different stable inputs returns `409`.
+- Source files can only be downloaded from a locally configured HTTPS host allowlist. Callers cannot change the allowlist through requests.
+- Results are retained for 10 minutes by default, with at most 16 terminal jobs retained. Results are no longer available after acknowledgment, expiration, or a service restart.
 
-## 运行
+## Running the Service
 
-### 前置要求
+### Prerequisites
 
 - Python `3.11+`
-- 能够安装 Docling 与其模型依赖的运行环境
-- 可访问 Docling 模型下载源，或已经准备好本地模型缓存
-- 一个不少于 32 个字符的内部 Token
-- 至少一个允许下载源文件的主机名
+- An environment that can install Docling and its model dependencies
+- Access to Docling model download sources, or a prepared local model cache
+- An internal token with at least 32 characters
+- At least one host allowed for source file downloads
 
-### 安装并启动
+### Install and Start
 
 ```bash
 git clone https://github.com/ryanmeowy/anchr-docling.git
@@ -56,40 +56,40 @@ source .venv/bin/activate
 pip install -e .
 
 cp .env.example .env
-# 修改 .env 中的 Token 和下载白名单。
+# Set the token and download allowlist in .env.
 
 uvicorn anchr_docling.main:app --host 127.0.0.1 --port 8091
 ```
 
-服务启动时会校验 `ANCHR_DOCLING_API_TOKEN` 和 `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS`。Anchr App 中的 `APP_DOCLING_API_TOKEN` 必须使用同一个 Token，`APP_DOCLING_BASE_URL` 指向当前服务地址。
+The service validates `ANCHR_DOCLING_API_TOKEN` and `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS` at startup. In Anchr App, `APP_DOCLING_API_TOKEN` must use the same token, and `APP_DOCLING_BASE_URL` must point to this service.
 
-默认会在启动阶段下载或检查布局、表格和公式相关模型，并初始化转换器。模型缓存尚未准备好时，第一次启动可能较慢。若部署环境不允许启动时访问模型缓存或网络，可以关闭预加载：
+By default, startup downloads or checks the layout, table, and formula models and initializes the converter. The first startup may take longer if the model cache is not ready. If the deployment environment does not allow access to the model cache or network at startup, disable preloading:
 
 ```bash
 ANCHR_DOCLING_PRELOAD_MODELS=false
 ```
 
-OCR 模型默认不预加载，只会在 `ocr: true` 或 OCR 回退时初始化。需要在启动阶段准备配置的 OCR 引擎时，设置：
+OCR models are not preloaded by default. They are initialized only when `ocr: true` is set or OCR fallback is triggered. To prepare the configured OCR engines at startup, set:
 
 ```bash
 ANCHR_DOCLING_PRELOAD_OCR_MODELS=true
 ```
 
-### 设备
+### Device
 
-默认设备是 `cpu`。也可以设置为 `mps`、`cuda`、`xpu` 或 `auto`，最终可用性取决于本机 PyTorch、Docling 模型和所选解析能力：
+The default device is `cpu`. You can also select `mps`, `cuda`, `xpu`, or `auto`; availability depends on the local PyTorch installation, Docling models, and selected parsing features:
 
 ```bash
 ANCHR_DOCLING_DEVICE=cpu
 ```
 
-当前依赖已将 `transformers` 约束在 `>=5.8.1,<5.9.0`，安装项目时会自动应用，不需要手工修改依赖版本。
+The project currently pins `transformers` to `>=5.8.1,<5.9.0`. This constraint is applied automatically during installation; no manual dependency adjustment is needed.
 
 ## API
 
-除 `/healthz` 外，所有 `/v1/*` 接口都需要 Bearer Token。Swagger、ReDoc 和 OpenAPI 默认关闭；本地调试可设置 `ANCHR_DOCLING_ENABLE_DOCS=true`。
+All `/v1/*` endpoints require a Bearer Token; `/healthz` does not. Swagger, ReDoc, and OpenAPI are disabled by default. Set `ANCHR_DOCLING_ENABLE_DOCS=true` for local debugging.
 
-### 健康检查
+### Health Check
 
 ```bash
 curl http://127.0.0.1:8091/healthz
@@ -104,9 +104,9 @@ curl http://127.0.0.1:8091/healthz
 }
 ```
 
-该接口只反映进程和队列状态，不验证模型、源文件主机或 OSS 的连通性。
+This endpoint reports only process and queue status. It does not verify model readiness or connectivity to source file hosts or OSS.
 
-### 提交任务
+### Submit a Job
 
 ```bash
 curl -X POST http://127.0.0.1:8091/v1/jobs \
@@ -127,45 +127,45 @@ curl -X POST http://127.0.0.1:8091/v1/jobs \
   }'
 ```
 
-`sourceUrl` 的主机必须出现在 `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS` 中。新任务返回 `202 Accepted`；幂等命中已有任务时返回 `200 OK`。
+The host in `sourceUrl` must appear in `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS`. New jobs return `202 Accepted`; an idempotent request matching an existing job returns `200 OK`.
 
-顶层字段：
+Top-level fields:
 
-| 字段 | 必填 | 说明 |
+| Field | Required | Description |
 | --- | --- | --- |
-| `requestId` | 是 | 解析 attempt 的幂等 ID，最长 200 个字符。App 使用 `taskId:itemId:parseAttempt`。 |
-| `contractVersion` | App 新请求是 | 支持 `1`、`2`、`3`。当前普通解析使用 v2，内嵌图片上传使用 v3。 |
-| `sourceRevision` | v2 / v3 是 | 稳定的源内容版本，最长 80 个字符；不能使用会刷新的签名 URL。 |
-| `sourceUrl` | 是 | 源文件 HTTPS 地址。 |
-| `fileName` | v2 / v3 是 | 含扩展名的文件名，用于选择解析路径。 |
-| `options` | 否 | 解析和输出选项。 |
-| `oss` | 图片上传时是 | 内嵌图片上传目标与加密 STS 凭据。 |
+| `requestId` | Yes | Idempotency ID for a parse attempt, up to 200 characters. The app uses `taskId:itemId:parseAttempt`. |
+| `contractVersion` | For new app requests | Supports `1`, `2`, and `3`. Standard parsing currently uses v2; embedded image uploads use v3. |
+| `sourceRevision` | For v2 / v3 | Stable source content revision, up to 80 characters. Do not use a signed URL that changes when refreshed. |
+| `sourceUrl` | Yes | HTTPS URL of the source file. |
+| `fileName` | For v2 / v3 | File name including its extension, used to select the parsing path. |
+| `options` | No | Parsing and output options. |
+| `oss` | For image uploads | Embedded image upload destination and encrypted STS credentials. |
 
-`contractVersion` 未传或为 v1 时，幂等指纹包含完整请求，主要用于兼容旧调用方。v2 和 v3 的指纹不包含会过期的 `sourceUrl` 与加密凭据，因此同一次 attempt 可以携带新的签名 URL 或 STS 凭据重试；`sourceRevision`、文件名、解析选项或稳定输出位置发生变化时，必须使用新的 `requestId`。
+When `contractVersion` is omitted or set to v1, the idempotency fingerprint includes the entire request, primarily for compatibility with older callers. The v2 and v3 fingerprints exclude the expiring `sourceUrl` and encrypted credentials, so the same attempt can be retried with a refreshed signed URL or STS credentials. Changes to `sourceRevision`, the file name, parsing options, or the stable output destination require a new `requestId`.
 
-解析选项：
+Parsing options:
 
-| 字段 | 默认值 | 说明 |
+| Field | Default | Description |
 | --- | --- | --- |
-| `outputFormat` | `markdown` | `markdown`、`html`、`text`、`json`、`blocks` 或 `chunks`。 |
-| `ocr` | `false` | 直接启用 OCR；图片输入通常需要开启。 |
-| `ocrFallback` | `false` | 非 OCR 结果被判定为乱码时，依次尝试配置的 OCR 引擎。 |
-| `tableStructure` | `true` | 启用表格结构识别。 |
-| `formulaEnrichment` | `false` | 启用 Docling 公式增强。会增加模型准备和解析时间。 |
-| `validateTextQuality` | `true` | 检查明显乱码；非图片空结果会被判定为失败。 |
-| `chunkMinTokens` | `400` | 自定义 Chunker 的目标下限；原生 Chunker 用于合并控制。 |
-| `chunkMaxTokens` | `800` | 自定义 Chunker 按估算字符数控制上限；原生 Chunker 按估算 Token 切分。 |
-| `useNativeChunker` | `false` | 使用 Docling `HybridChunker`；否则按 Markdown 结构切分。 |
-| `includeEmbeddedImages` | `false` | 对 `markdown`、`blocks`、`chunks` 启用内嵌图片处理。 |
+| `outputFormat` | `markdown` | `markdown`, `html`, `text`, `json`, `blocks`, or `chunks`. |
+| `ocr` | `false` | Enables OCR directly; usually needed for image inputs. |
+| `ocrFallback` | `false` | Tries the configured OCR engines in order when non-OCR output is classified as garbled text. |
+| `tableStructure` | `true` | Enables table structure recognition. |
+| `formulaEnrichment` | `false` | Enables Docling formula enrichment. Adds model preparation and parsing time. |
+| `validateTextQuality` | `true` | Checks for clearly garbled text; empty results from non-image inputs are treated as failures. |
+| `chunkMinTokens` | `400` | Target lower bound for the custom chunker; controls merging in the native chunker. |
+| `chunkMaxTokens` | `800` | The custom chunker limits size using estimated character counts; the native chunker splits using estimated token counts. |
+| `useNativeChunker` | `false` | Uses Docling `HybridChunker`; otherwise splits by Markdown structure. |
+| `includeEmbeddedImages` | `false` | Enables embedded image processing for `markdown`, `blocks`, and `chunks`. |
 
-### 查询和确认结果
+### Retrieve and Acknowledge Results
 
 ```bash
 curl http://127.0.0.1:8091/v1/jobs/<jobId> \
   -H "Authorization: Bearer <internal-token>"
 ```
 
-任务状态为 `queued`、`running`、`succeeded` 或 `failed`。成功结果位于 `result`，失败信息位于 `error`：
+Job status is `queued`, `running`, `succeeded`, or `failed`. Successful output is in `result`, and failure details are in `error`:
 
 ```json
 {
@@ -180,7 +180,7 @@ curl http://127.0.0.1:8091/v1/jobs/<jobId> \
     "parser": "docling",
     "format": "chunks",
     "fileType": "pdf",
-    "text": "# 解析后的文档",
+    "text": "# Parsed document",
     "pages": [],
     "document": null,
     "blocks": null,
@@ -192,46 +192,46 @@ curl http://127.0.0.1:8091/v1/jobs/<jobId> \
 }
 ```
 
-读取终态后可发送 DELETE 释放内存记录：
+After reading a terminal result, send DELETE to release its in-memory record:
 
 ```bash
 curl -X DELETE http://127.0.0.1:8091/v1/jobs/<jobId> \
   -H "Authorization: Bearer <internal-token>"
 ```
 
-终态任务、已确认任务、已过期任务和重启后丢失的任务都返回 `204 No Content`。删除仍在排队或运行的任务返回 `409`，该接口不是取消操作。
+Terminal jobs, acknowledged jobs, expired jobs, and jobs lost after a restart all return `204 No Content`. Deleting a queued or running job returns `409`; this endpoint does not cancel jobs.
 
-### 输入与输出
+### Inputs and Outputs
 
-当前适配代码明确区分以下输入：
+The current adapter explicitly handles these inputs:
 
-| 输入 | 支持的输出 | 说明 |
+| Input | Supported Outputs | Description |
 | --- | --- | --- |
-| PDF | 全部格式 | 支持表格、OCR、公式增强和页级结果。 |
-| PNG、JPEG、TIFF、BMP、GIF、WebP | 全部格式 | 空文本可作为成功结果返回；需要文本时应开启 OCR。 |
-| Markdown、纯文本 | 仅 `chunks` | Markdown 使用 Docling 结构，纯文本按段落构造文档。 |
+| PDF | All formats | Supports tables, OCR, formula enrichment, and page-level results. |
+| PNG, JPEG, TIFF, BMP, GIF, WebP | All formats | Empty text can be returned as a successful result. Enable OCR when text is needed. |
+| Markdown, plain text | `chunks` only | Markdown uses Docling structure; plain text is converted into a document by paragraph. |
 
-其他扩展名目前没有独立适配和测试保证，不应仅根据 Docling 上游的格式列表视为本服务已支持。
+Other extensions currently have no dedicated adapters or test coverage. Do not assume this service supports them solely because they appear in Docling's upstream format list.
 
-| 输出格式 | 主要结果 |
+| Output Format | Main Result |
 | --- | --- |
-| `markdown` | `text` 和 `pages[].text` 为 Markdown。 |
-| `html` | `text` 和页级文本为 HTML。 |
-| `text` | 纯文本。 |
-| `json` | `document` 为完整 Docling 结构，`text` 保留聚合文本。 |
-| `blocks` | `blocks` 为应用侧 Block 列表，包含层级、页码、坐标和可选图片字段。 |
-| `chunks` | `chunks` 包含 `text`、`textPlain`、`charCount`，可带 `pageRange`、`bboxes` 和 `headings`。 |
+| `markdown` | `text` and `pages[].text` contain Markdown. |
+| `html` | `text` and page-level text contain HTML. |
+| `text` | Plain text. |
+| `json` | `document` contains the complete Docling structure; `text` retains the aggregated text. |
+| `blocks` | `blocks` contains app-level blocks with hierarchy, page numbers, coordinates, and optional image fields. |
+| `chunks` | `chunks` contains `text`, `textPlain`, and `charCount`, with optional `pageRange`, `bboxes`, and `headings`. |
 
-图片输入没有提取到文本时仍返回 `succeeded`，`text` 为空字符串；非图片输入为空时返回 `DOCLING_PARSE_ERROR`。启用文本质量校验后，明显乱码会失败；设置 `ocrFallback: true` 可在首次转换质量不合格时尝试 OCR。
+Image inputs with no extracted text still return `succeeded` with an empty `text` string. Empty results from non-image inputs return `DOCLING_PARSE_ERROR`. With text quality validation enabled, clearly garbled output fails. Set `ocrFallback: true` to try OCR when the first conversion fails the quality check.
 
-## 内嵌图片上传
+## Embedded Image Uploads
 
-内嵌图片上传默认关闭。当前 App 只在 `includeEmbeddedImages=true` 时使用 contract v3，并发送 OSS 目标和 AES-GCM 加密的临时 STS 凭据。
+Embedded image uploads are disabled by default. The app currently uses contract v3 only when `includeEmbeddedImages=true`, sending an OSS destination and temporary STS credentials encrypted with AES-GCM.
 
-Docling 侧需要配置共享 AES 密钥和允许上传的原子目标：
+On the Docling side, configure a shared AES key and allowed upload target combinations:
 
 ```bash
-ANCHR_DOCLING_OSS_ENCRYPT_KEY=<32 字节原文或 Base64 密钥>
+ANCHR_DOCLING_OSS_ENCRYPT_KEY=<32-byte raw key or Base64-encoded key>
 ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS='[
   {
     "endpoint": "oss-cn-hangzhou.aliyuncs.com",
@@ -241,9 +241,9 @@ ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS='[
 ]'
 ```
 
-每条规则绑定完整的 `endpoint`、`bucket` 和 `prefix`。字段不支持通配符；prefix 只匹配自身或以 `/` 分隔的子目录。空白名单允许服务启动，但所有图片上传都会被拒绝，文本解析仍可通过 `warnings` 降级完成。
+Each rule binds a complete `endpoint`, `bucket`, and `prefix` combination. Wildcards are not supported. A prefix matches only itself or subdirectories separated by `/`. An empty allowlist permits startup but rejects all image uploads; text parsing can still complete with `warnings` indicating degraded output.
 
-v3 请求中的 `oss` 结构：
+The `oss` structure in a v3 request:
 
 ```json
 {
@@ -262,39 +262,39 @@ v3 请求中的 `oss` 结构：
 }
 ```
 
-`ATTEMPT_PREFIX_V1` 要求非空 `basePath`，图片对象名为 `{basePath}/{sanitizedBlockId}.png`。同一 attempt 重试时，相同 Block 会得到相同对象 Key。`images[].imageObjectKey` 是持久化身份，`url` 只用于返回内容渲染。
+`ATTEMPT_PREFIX_V1` requires a non-empty `basePath`. Image object names follow `{basePath}/{sanitizedBlockId}.png`. Retrying the same attempt produces the same object key for the same block. `images[].imageObjectKey` is the persistent identity; `url` is used only to render the returned content.
 
-## 配置
+## Configuration
 
-Pydantic Settings 会自动读取仓库根目录的 `.env`。以下是主要配置及代码默认值：
+Pydantic Settings automatically reads `.env` from the repository root. Main settings and their code defaults:
 
-| 环境变量 | 默认值 | 用途 |
+| Environment Variable | Default | Purpose |
 | --- | --- | --- |
-| `ANCHR_DOCLING_HOST` | `127.0.0.1` | 服务监听地址；使用命令行启动时仍以 Uvicorn 参数为准。 |
-| `ANCHR_DOCLING_PORT` | `8091` | 服务端口；使用命令行启动时仍以 Uvicorn 参数为准。 |
-| `ANCHR_DOCLING_API_TOKEN` | 无有效默认值 | `/v1/*` 的内部 Bearer Token，至少 32 个字符。 |
-| `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS` | 空 | 逗号分隔的精确下载主机名；启动时不能为空。 |
-| `ANCHR_DOCLING_WORKERS` | `1` | 解析 worker 数量。 |
-| `ANCHR_DOCLING_QUEUE_CAPACITY` | `8` | 等待队列容量，不含正在运行的任务。 |
-| `ANCHR_DOCLING_QUEUE_WAIT_TIMEOUT_SECONDS` | `1800` | 任务允许排队的最长时间。 |
-| `ANCHR_DOCLING_RESULT_TTL_SECONDS` | `600` | 终态结果保留时间。 |
-| `ANCHR_DOCLING_MAX_RETAINED_RESULTS` | `16` | 内存中最多保留的终态结果数。 |
-| `ANCHR_DOCLING_MAX_DOWNLOAD_MB` | `100` | 单次源文件或 Markdown 图片下载上限。 |
-| `ANCHR_DOCLING_MAX_DOWNLOAD_REDIRECTS` | `3` | 下载重定向上限。 |
-| `ANCHR_DOCLING_MAX_IMAGE_MEGAPIXELS` | `80` | 图片解码尺寸上限。 |
-| `ANCHR_DOCLING_DEVICE` | `cpu` | Docling 加速设备。 |
-| `ANCHR_DOCLING_OCR_ENGINES` | `ocrmac,rapidocr` | OCR 与回退尝试顺序。非 macOS 环境应按实际安装的引擎调整。 |
-| `ANCHR_DOCLING_OCR_LANG` | `chinese` | OCR 语言；各引擎会映射为对应语言代码。 |
-| `ANCHR_DOCLING_FORCE_FULL_PAGE_OCR` | `true` | OCR 时启用全页识别。 |
-| `ANCHR_DOCLING_PRELOAD_MODELS` | `true` | 启动时准备基础模型并初始化转换器。 |
-| `ANCHR_DOCLING_PRELOAD_OCR_MODELS` | `false` | 启动时同时初始化配置的 OCR 引擎。 |
-| `ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS` | `[]` | 允许的 OSS endpoint、bucket、prefix 组合。 |
-| `ANCHR_DOCLING_OSS_ENCRYPT_KEY` | 空 | 解密 v3 STS 凭据的 AES 密钥。 |
-| `ANCHR_DOCLING_ENABLE_DOCS` | `false` | 是否开放 `/docs`、`/redoc` 和 `/openapi.json`。 |
+| `ANCHR_DOCLING_HOST` | `127.0.0.1` | Service bind address; Uvicorn arguments take precedence when started from the command line. |
+| `ANCHR_DOCLING_PORT` | `8091` | Service port; Uvicorn arguments take precedence when started from the command line. |
+| `ANCHR_DOCLING_API_TOKEN` | No valid default | Internal Bearer Token for `/v1/*`, at least 32 characters. |
+| `ANCHR_DOCLING_ALLOWED_DOWNLOAD_HOSTS` | Empty | Comma-separated exact download host names; must not be empty at startup. |
+| `ANCHR_DOCLING_WORKERS` | `1` | Number of parsing workers. |
+| `ANCHR_DOCLING_QUEUE_CAPACITY` | `8` | Waiting queue capacity, excluding running jobs. |
+| `ANCHR_DOCLING_QUEUE_WAIT_TIMEOUT_SECONDS` | `1800` | Maximum time a job may wait in the queue. |
+| `ANCHR_DOCLING_RESULT_TTL_SECONDS` | `600` | Retention time for terminal results. |
+| `ANCHR_DOCLING_MAX_RETAINED_RESULTS` | `16` | Maximum number of terminal results retained in memory. |
+| `ANCHR_DOCLING_MAX_DOWNLOAD_MB` | `100` | Maximum size of a single source file or Markdown image download. |
+| `ANCHR_DOCLING_MAX_DOWNLOAD_REDIRECTS` | `3` | Maximum download redirects. |
+| `ANCHR_DOCLING_MAX_IMAGE_MEGAPIXELS` | `80` | Maximum decoded image size. |
+| `ANCHR_DOCLING_DEVICE` | `cpu` | Docling acceleration device. |
+| `ANCHR_DOCLING_OCR_ENGINES` | `ocrmac,rapidocr` | OCR and fallback engine order. Adjust to the installed engines on non-macOS systems. |
+| `ANCHR_DOCLING_OCR_LANG` | `chinese` | OCR language; each engine maps it to its own language code. |
+| `ANCHR_DOCLING_FORCE_FULL_PAGE_OCR` | `true` | Enables full-page recognition during OCR. |
+| `ANCHR_DOCLING_PRELOAD_MODELS` | `true` | Prepares base models and initializes the converter at startup. |
+| `ANCHR_DOCLING_PRELOAD_OCR_MODELS` | `false` | Also initializes the configured OCR engines at startup. |
+| `ANCHR_DOCLING_ALLOWED_UPLOAD_TARGETS` | `[]` | Allowed OSS endpoint, bucket, and prefix combinations. |
+| `ANCHR_DOCLING_OSS_ENCRYPT_KEY` | Empty | AES key for decrypting v3 STS credentials. |
+| `ANCHR_DOCLING_ENABLE_DOCS` | `false` | Enables `/docs`, `/redoc`, and `/openapi.json`. |
 
-下载地址必须使用 HTTPS 默认端口，不能包含用户信息。初始 URL 和每次重定向都会重新校验主机白名单。队列可以限制并发和等待数量，但当前实现不会强制终止已经进入解析阶段的单个任务，也没有把解析任务隔离到独立子进程。
+Download URLs must use the default HTTPS port and contain no user information. The host allowlist is checked for the initial URL and every redirect. The queue limits concurrency and the number of waiting jobs, but the current implementation does not forcibly terminate a job once parsing has started or isolate parsing jobs in separate subprocesses.
 
-## 开发
+## Development
 
 ```bash
 python -m venv .venv
@@ -305,8 +305,8 @@ ruff check .
 pytest -q
 ```
 
-`scripts/verify_bbox.py` 和 `scripts/verify_pdf_bbox.py` 用于检查 Chunk/Block 的页码与坐标输出，需要本地准备相应样本。
+`scripts/verify_bbox.py` and `scripts/verify_pdf_bbox.py` check page numbers and coordinates in chunk/block output. Prepare the corresponding samples locally before running them.
 
 ## License
 
-本项目基于 [MIT License](./LICENSE) 开源。
+This project is open source under the [MIT License](./LICENSE).
